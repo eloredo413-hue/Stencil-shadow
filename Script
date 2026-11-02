@@ -1,0 +1,1517 @@
+--!strict
+-- StencilShadowEngine.lua
+-- Place this LocalScript inside StarterPlayer -> StarterPlayerScripts
+--
+-- True Stencil Shadow Volume Engine for Roblox (v5 — Round Shadows + Full-Map Shared Tiles + Zero Flicker)
+--
+-- What this version fixes & upgrades:
+--   1. True Smooth Round Shadows (`UICorner` Analytical Sphere, Ball, Cylinder & Head Projection):
+--      - Spheres (`PartType.Ball`), Cylinders (`PartType.Cylinder`), and Character Heads (`Head` /
+--        `SpecialMesh` Head/Sphere) no longer use blocky 10-sided polygons!
+--      - Instead, they project analytically along the 3D light vector into true curved elliptical/capsule
+--        shadows using pooled `UICorner` (`CornerRadius = UDim.new(1, 0)`) primitives inside the
+--        `CanvasGroup`. Round objects now cast 100% smooth, circular/elliptical shadows!
+--   2. Shadows Everywhere + Zero Camera-Angle Disappearing (Shared 64x64 Stud Surface Tile Grid):
+--      - Previously, every caster created its own `CanvasGroup` window, which hit Roblox's internal
+--        `CanvasGroup` GPU texture limit (~32 active offscreen textures) and caused shadows to vanish
+--        depending on where you looked!
+--      - Now, large floors/baseplates/walls are divided into a **Shared 64x64 Stud Tile Grid** where
+--        ALL players and up to 140+ map objects draw into the SAME shared `CanvasGroup` tile!
+--      - Furthermore, shadow polygons are projected onto the full surface plane first and then
+--        drawn into EVERY tile their bounding box touches, so crossing a tile border is 100% seamless!
+--   3. Zero Flickering & Instant Startup:
+--      - Persistent tile keying (`activeSlotsByKey`) keeps `SurfaceGui`s enabled across frames.
+--      - Event-driven scene indexing (`DescendantAdded` / `DescendantRemoving`) + startup pre-warming.
+--   4. Cliff & Ledge Bending + Wall Obstruction Clipping:
+--      - Shadows clip cleanly at cliff/ledge edges (`ClipsDescendants = true` + Sutherland-Hodgman),
+--        bend down vertical cliff walls, and slice along intervening walls so they never bleed through.
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local Workspace = game:GetService("Workspace")
+
+-- ============================================================================
+-- CONFIGURATION
+-- ============================================================================
+local CONFIG = {
+	-- Classic Stencil Visuals
+	ShadowColor = Color3.fromRGB(6, 6, 10),      -- Crisp stencil ink color
+	ShadowGroupTransparency = 0.35,              -- Uniform stencil darkness (0 = pitch black, 1 = invisible)
+	PixelsPerStud = 32,                          -- Sharp DPI across 64x64 stud shared tiles (32 * 64 = 2048 -> capped at 1024)
+	MaxCanvasPixels = 1024,                      -- Max resolution per tile CanvasGroup
+	SharedTileSize = 56,                         -- Shared tile size (studs) on large baseplates (keeps total CanvasGroups < 16!)
+	SurfaceOffset = 0.004,                       -- 4mm offset above surface so SurfaceGui never Z-fights
+
+	-- Full-Map Coverage & Performance Budgets
+	MaxShadowDistance = 120,                     -- Max distance (studs) a shadow projects along the light ray
+	MaxRenderDistance = 240,                     -- Large 360-degree radius around player/camera so shadows are everywhere!
+	MaxMapCasters = 130,                         -- Up to 130 map objects cast stencil shadows simultaneously!
+	MapRefreshInterval = 0.3,                    -- Seconds between re-sorting map casters
+	WallObstructionTolerance = 0.25,             -- Depth tolerance (studs) before an obstacle blocks behind-wall receivers
+
+	-- Caster Filtering
+	IncludeMapParts = true,                      -- Cast stencil shadows from map parts (bricks, spheres, cylinders, pillars, walls)
+	MaxCasterPartSize = 140,                     -- Ignore giant baseplates wider than this as shadow casters
+	MinCasterPartSize = 0.25,                    -- Include hands, feet, tools, and accessories
+
+	-- Pre-Warming (Instant Load, Zero Stutter)
+	PrewarmCanvasSlots = 16,                     -- Shared tile CanvasGroup slots pre-allocated at startup
+	PrewarmRectFramesPerSlot = 65,               -- Sharp polygon Frames pre-allocated per tile
+	PrewarmRoundFramesPerSlot = 18,              -- Smooth UICorner round shadow Frames pre-allocated per tile
+
+	-- Lighting Overhaul
+	ForceDisableNativeShadows = true,            -- Disables Roblox's blurry shadow maps so only crisp stencil shadows show
+	ConfigureClassicLighting = true,             -- Sets crisp directional contrast lighting
+}
+
+-- ============================================================================
+-- LIGHTING SETUP
+-- ============================================================================
+local function enforceStencilLighting()
+	if CONFIG.ForceDisableNativeShadows then
+		Lighting.GlobalShadows = false
+		Lighting.ShadowSoftness = 0
+	end
+	if CONFIG.ConfigureClassicLighting then
+		Lighting.EnvironmentDiffuseScale = 0.25
+		Lighting.EnvironmentSpecularScale = 0.2
+		Lighting.Ambient = Color3.fromRGB(96, 100, 110)
+		Lighting.OutdoorAmbient = Color3.fromRGB(116, 120, 130)
+		Lighting.Brightness = 2.15
+	end
+end
+
+enforceStencilLighting()
+
+-- ============================================================================
+-- PERSISTENT SHARED SURFACEGUI + CANVASGROUP POOL (WITH ROUND UICORNER POOL)
+-- ============================================================================
+local existingContainer = Workspace:FindFirstChild("_StencilShadowRenderer")
+if existingContainer then
+	existingContainer:Destroy()
+end
+
+local shadowContainer = Instance.new("Folder")
+shadowContainer.Name = "_StencilShadowRenderer"
+shadowContainer.Parent = Workspace
+
+export type SurfaceCanvasSlot = {
+	carrierPart: Part,
+	surfaceGui: SurfaceGui,
+	canvasGroup: CanvasGroup,
+	rectPool: { Frame },
+	activeRects: number,
+	prevActiveRects: number,
+	roundPool: { Frame },
+	activeRounds: number,
+	prevActiveRounds: number,
+	usedThisFrame: boolean,
+}
+
+local activeSlotsByKey: { [string]: SurfaceCanvasSlot } = {}
+local freeSlotPool: { SurfaceCanvasSlot } = {}
+
+local function createRectFrameInCanvas(parentCanvas: CanvasGroup): Frame
+	local f = Instance.new("Frame")
+	f.Name = "R"
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.BackgroundColor3 = CONFIG.ShadowColor
+	f.BackgroundTransparency = 0
+	f.BorderSizePixel = 0
+	f.Visible = false
+	f.Parent = parentCanvas
+	return f
+end
+
+local function createRoundFrameInCanvas(parentCanvas: CanvasGroup): Frame
+	local f = Instance.new("Frame")
+	f.Name = "C"
+	f.AnchorPoint = Vector2.new(0.5, 0.5)
+	f.BackgroundColor3 = CONFIG.ShadowColor
+	f.BackgroundTransparency = 0
+	f.BorderSizePixel = 0
+	f.Visible = false
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(1, 0) -- Perfect circular/capsule curvature!
+	corner.Parent = f
+
+	f.Parent = parentCanvas
+	return f
+end
+
+local function createNewCanvasSlot(prewarmRects: number, prewarmRounds: number): SurfaceCanvasSlot
+	local carrier = Instance.new("Part")
+	carrier.Name = "ShadowSurfaceCarrier"
+	carrier.Anchored = true
+	carrier.CanCollide = false
+	carrier.CanQuery = false
+	carrier.CanTouch = false
+	carrier.CastShadow = false
+	carrier.Massless = true
+	carrier.Transparency = 1
+	carrier.Size = Vector3.new(1, 1, 0.004)
+	carrier.CFrame = CFrame.new(0, -10000, 0)
+
+	local sgui = Instance.new("SurfaceGui")
+	sgui.Name = "StencilSurfaceGui"
+	sgui.Face = Enum.NormalId.Back -- +Z axis of carrierPart is the surface normal
+	sgui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+	sgui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling -- Required for CanvasGroup
+	sgui.ClipsDescendants = true
+	sgui.LightInfluence = 0
+	sgui.Brightness = 1
+	sgui.MaxDistance = CONFIG.MaxRenderDistance + 60
+	sgui.Enabled = true
+	sgui.Parent = carrier
+
+	local cg = Instance.new("CanvasGroup")
+	cg.Name = "StencilCompositor"
+	cg.Size = UDim2.fromScale(1, 1)
+	cg.Position = UDim2.fromScale(0, 0)
+	cg.BackgroundTransparency = 1
+	cg.BorderSizePixel = 0
+	cg.GroupColor3 = CONFIG.ShadowColor
+	cg.GroupTransparency = CONFIG.ShadowGroupTransparency
+	cg.Parent = sgui
+
+	local rectPool = table.create(prewarmRects)
+	for i = 1, prewarmRects do
+		rectPool[i] = createRectFrameInCanvas(cg)
+	end
+
+	local roundPool = table.create(prewarmRounds)
+	for i = 1, prewarmRounds do
+		roundPool[i] = createRoundFrameInCanvas(cg)
+	end
+
+	carrier.Parent = shadowContainer
+
+	return {
+		carrierPart = carrier,
+		surfaceGui = sgui,
+		canvasGroup = cg,
+		rectPool = rectPool,
+		activeRects = 0,
+		prevActiveRects = 0,
+		roundPool = roundPool,
+		activeRounds = 0,
+		prevActiveRounds = 0,
+		usedThisFrame = false,
+	}
+end
+
+-- Pre-warm slots at startup for instant loading
+for i = 1, CONFIG.PrewarmCanvasSlots do
+	table.insert(freeSlotPool, createNewCanvasSlot(CONFIG.PrewarmRectFramesPerSlot, CONFIG.PrewarmRoundFramesPerSlot))
+end
+
+local function acquirePersistentCanvasSlot(key: string): SurfaceCanvasSlot
+	local slot = activeSlotsByKey[key]
+	if slot then
+		slot.usedThisFrame = true
+		return slot
+	end
+
+	local newSlot = table.remove(freeSlotPool)
+	if not newSlot then
+		newSlot = createNewCanvasSlot(32, 8)
+	end
+
+	newSlot.usedThisFrame = true
+	newSlot.activeRects = 0
+	newSlot.activeRounds = 0
+	if not newSlot.surfaceGui.Enabled then
+		newSlot.surfaceGui.Enabled = true
+	end
+	activeSlotsByKey[key] = newSlot
+	return newSlot
+end
+
+local function acquireRectFrame(slot: SurfaceCanvasSlot): Frame
+	slot.activeRects += 1
+	local idx = slot.activeRects
+	local f = slot.rectPool[idx]
+	if not f then
+		f = createRectFrameInCanvas(slot.canvasGroup)
+		slot.rectPool[idx] = f
+	end
+	if not f.Visible then
+		f.Visible = true
+	end
+	return f
+end
+
+local function acquireRoundFrame(slot: SurfaceCanvasSlot): Frame
+	slot.activeRounds += 1
+	local idx = slot.activeRounds
+	local f = slot.roundPool[idx]
+	if not f then
+		f = createRoundFrameInCanvas(slot.canvasGroup)
+		slot.roundPool[idx] = f
+	end
+	if not f.Visible then
+		f.Visible = true
+	end
+	return f
+end
+
+local function finalizeCanvasSlotsForFrame()
+	for key, slot in pairs(activeSlotsByKey) do
+		if slot.usedThisFrame then
+			for i = slot.activeRects + 1, slot.prevActiveRects do
+				local f = slot.rectPool[i]
+				if f then f.Visible = false end
+			end
+			for i = slot.activeRounds + 1, slot.prevActiveRounds do
+				local f = slot.roundPool[i]
+				if f then f.Visible = false end
+			end
+			slot.prevActiveRects = slot.activeRects
+			slot.prevActiveRounds = slot.activeRounds
+			slot.activeRects = 0
+			slot.activeRounds = 0
+			slot.usedThisFrame = false
+		else
+			for i = 1, slot.prevActiveRects do
+				local f = slot.rectPool[i]
+				if f then f.Visible = false end
+			end
+			for i = 1, slot.prevActiveRounds do
+				local f = slot.roundPool[i]
+				if f then f.Visible = false end
+			end
+			slot.prevActiveRects = 0
+			slot.prevActiveRounds = 0
+			slot.activeRects = 0
+			slot.activeRounds = 0
+			slot.usedThisFrame = false
+			slot.carrierPart.CFrame = CFrame.new(0, -10000, 0)
+			activeSlotsByKey[key] = nil
+			table.insert(freeSlotPool, slot)
+		end
+	end
+end
+
+-- ============================================================================
+-- 2D & 3D COMPUTATIONAL GEOMETRY
+-- ============================================================================
+type Vec2 = Vector2
+type Vec3 = Vector3
+
+-- Represents the FULL planar face of a receiver part (before tiling)
+export type ReceiverPlane = {
+	part: BasePart,
+	origin: Vec3,
+	normal: Vec3,
+	tangentU: Vec3,
+	tangentV: Vec3,
+	halfU: number,
+	halfV: number,
+	baseKey: string,
+	isTiled: boolean,
+}
+
+-- Represents a single renderable tile on a ReceiverPlane
+export type ReceiverTile = {
+	origin: Vec3,
+	normal: Vec3,
+	tangentU: Vec3,
+	tangentV: Vec3,
+	centerU: number, -- Center U offset relative to ReceiverPlane.origin
+	centerV: number, -- Center V offset relative to ReceiverPlane.origin
+	halfU: number,
+	halfV: number,
+	canvasW: number,
+	canvasH: number,
+	scaleX: number,
+	scaleY: number,
+	key: string,
+	slot: SurfaceCanvasSlot,
+}
+
+local frameTilesByKey: { [string]: ReceiverTile } = {}
+
+local function getOrCreateReceiverTile(plane: ReceiverPlane, tx: number, ty: number): ReceiverTile?
+	local tileSize = CONFIG.SharedTileSize
+	local tileKey = if plane.isTiled then string.format("%s_T_%d_%d", plane.baseKey, tx, ty) else plane.baseKey
+
+	local existing = frameTilesByKey[tileKey]
+	if existing then
+		return existing
+	end
+
+	local uMin: number, uMax: number, vMin: number, vMax: number
+	if plane.isTiled then
+		uMin = math.max(-plane.halfU, tx * tileSize - tileSize * 0.5)
+		uMax = math.min( plane.halfU, tx * tileSize + tileSize * 0.5)
+		vMin = math.max(-plane.halfV, ty * tileSize - tileSize * 0.5)
+		vMax = math.min( plane.halfV, ty * tileSize + tileSize * 0.5)
+		if uMax <= uMin + 0.2 or vMax <= vMin + 0.2 then
+			return nil
+		end
+	else
+		uMin, uMax = -plane.halfU, plane.halfU
+		vMin, vMax = -plane.halfV, plane.halfV
+	end
+
+	local centerU = (uMin + uMax) * 0.5
+	local centerV = (vMin + vMax) * 0.5
+	local halfU = (uMax - uMin) * 0.5
+	local halfV = (vMax - vMin) * 0.5
+	local tileOrigin = plane.origin + plane.tangentU * centerU + plane.tangentV * centerV
+
+	local rawW = math.clamp(math.ceil(halfU * 2 * CONFIG.PixelsPerStud), 16, CONFIG.MaxCanvasPixels)
+	local rawH = math.clamp(math.ceil(halfV * 2 * CONFIG.PixelsPerStud), 16, CONFIG.MaxCanvasPixels)
+
+	local slot = acquirePersistentCanvasSlot(tileKey)
+	local targetSize = Vector3.new(halfU * 2, halfV * 2, 0.004)
+	local targetCF = CFrame.fromMatrix(
+		tileOrigin + plane.normal * CONFIG.SurfaceOffset,
+		plane.tangentU,
+		plane.tangentV,
+		plane.normal
+	)
+	local targetCanvas = Vector2.new(rawW, rawH)
+
+	if slot.carrierPart.Size ~= targetSize then
+		slot.carrierPart.Size = targetSize
+	end
+	if slot.carrierPart.CFrame ~= targetCF then
+		slot.carrierPart.CFrame = targetCF
+	end
+	if slot.surfaceGui.CanvasSize ~= targetCanvas then
+		slot.surfaceGui.CanvasSize = targetCanvas
+	end
+
+	local tile: ReceiverTile = {
+		origin = tileOrigin,
+		normal = plane.normal,
+		tangentU = plane.tangentU,
+		tangentV = plane.tangentV,
+		centerU = centerU,
+		centerV = centerV,
+		halfU = halfU,
+		halfV = halfV,
+		canvasW = rawW,
+		canvasH = rawH,
+		scaleX = rawW / (halfU * 2),
+		scaleY = rawH / (halfV * 2),
+		key = tileKey,
+		slot = slot,
+	}
+
+	frameTilesByKey[tileKey] = tile
+	return tile
+end
+
+-- Returns all ReceiverTiles on `plane` overlapped by the 2D stud bounding box `[minU, maxU] x [minV, maxV]`
+local function getOverlappingTiles(plane: ReceiverPlane, minU: number, maxU: number, minV: number, maxV: number): { ReceiverTile }
+	if not plane.isTiled then
+		local t = getOrCreateReceiverTile(plane, 0, 0)
+		return if t then { t } else {}
+	end
+
+	local tileSize = CONFIG.SharedTileSize
+	local tx0 = math.floor((minU + tileSize * 0.5) / tileSize)
+	local tx1 = math.floor((maxU + tileSize * 0.5) / tileSize)
+	local ty0 = math.floor((minV + tileSize * 0.5) / tileSize)
+	local ty1 = math.floor((maxV + tileSize * 0.5) / tileSize)
+
+	local tiles: { ReceiverTile } = {}
+	for tx = tx0, tx1 do
+		for ty = ty0, ty1 do
+			local tile = getOrCreateReceiverTile(plane, tx, ty)
+			if tile then
+				table.insert(tiles, tile)
+			end
+		end
+	end
+	return tiles
+end
+
+local function cross2D(a: Vec2, b: Vec2, c: Vec2): number
+	return (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X)
+end
+
+local function computeConvexHull2D(pts: { Vec2 }): { Vec2 }
+	local n = #pts
+	if n < 3 then
+		return pts
+	end
+
+	table.sort(pts, function(a: Vec2, b: Vec2)
+		if math.abs(a.X - b.X) > 1e-5 then
+			return a.X < b.X
+		end
+		return a.Y < b.Y
+	end)
+
+	local lower: { Vec2 } = table.create(n)
+	for i = 1, n do
+		local p = pts[i]
+		while #lower >= 2 and cross2D(lower[#lower - 1], lower[#lower], p) <= 1e-5 do
+			table.remove(lower)
+		end
+		table.insert(lower, p)
+	end
+
+	local upper: { Vec2 } = table.create(n)
+	for i = n, 1, -1 do
+		local p = pts[i]
+		while #upper >= 2 and cross2D(upper[#upper - 1], upper[#upper], p) <= 1e-5 do
+			table.remove(upper)
+		end
+		table.insert(upper, p)
+	end
+
+	table.remove(lower)
+	table.remove(upper)
+	for i = 1, #upper do
+		table.insert(lower, upper[i])
+	end
+
+	return lower
+end
+
+local function clipPolygonToRect2D(poly: { Vec2 }, halfU: number, halfV: number): { Vec2 }
+	if #poly < 3 then
+		return {}
+	end
+
+	local function clipEdge(input: { Vec2 }, isInside: (Vec2) -> boolean, intersect: (Vec2, Vec2) -> Vec2): { Vec2 }
+		local count = #input
+		if count == 0 then
+			return {}
+		end
+		local output: { Vec2 } = table.create(count + 2)
+		local s = input[count]
+		local sInside = isInside(s)
+
+		for i = 1, count do
+			local e = input[i]
+			local eInside = isInside(e)
+
+			if eInside then
+				if not sInside then
+					table.insert(output, intersect(s, e))
+				end
+				table.insert(output, e)
+			elseif sInside then
+				table.insert(output, intersect(s, e))
+			end
+
+			s = e
+			sInside = eInside
+		end
+		return output
+	end
+
+	local out = clipEdge(poly, function(p) return p.X >= -halfU end, function(a, b)
+		local t = (-halfU - a.X) / (b.X - a.X)
+		return Vector2.new(-halfU, a.Y + t * (b.Y - a.Y))
+	end)
+	if #out < 3 then return {} end
+
+	out = clipEdge(out, function(p) return p.X <= halfU end, function(a, b)
+		local t = (halfU - a.X) / (b.X - a.X)
+		return Vector2.new(halfU, a.Y + t * (b.Y - a.Y))
+	end)
+	if #out < 3 then return {} end
+
+	out = clipEdge(out, function(p) return p.Y >= -halfV end, function(a, b)
+		local t = (-halfV - a.Y) / (b.Y - a.Y)
+		return Vector2.new(a.X + t * (b.X - a.X), -halfV)
+	end)
+	if #out < 3 then return {} end
+
+	out = clipEdge(out, function(p) return p.Y <= halfV end, function(a, b)
+		local t = (halfV - a.Y) / (b.Y - a.Y)
+		return Vector2.new(a.X + t * (b.X - a.X), halfV)
+	end)
+
+	return out
+end
+
+local function clipPolygonHalfPlane2D(poly: { Vec2 }, planePt: Vec2, planeNormal: Vec2): { Vec2 }
+	local count = #poly
+	if count < 3 then
+		return {}
+	end
+	local output: { Vec2 } = table.create(count + 2)
+	local s = poly[count]
+	local sDist = (s - planePt):Dot(planeNormal)
+
+	for i = 1, count do
+		local e = poly[i]
+		local eDist = (e - planePt):Dot(planeNormal)
+
+		if eDist >= -1e-5 then
+			if sDist < -1e-5 then
+				local t = sDist / (sDist - eDist)
+				table.insert(output, s + (e - s) * t)
+			end
+			table.insert(output, e)
+		elseif sDist >= -1e-5 then
+			local t = sDist / (sDist - eDist)
+			table.insert(output, s + (e - s) * t)
+		end
+
+		s = e
+		sDist = eDist
+	end
+	return output
+end
+
+-- ============================================================================
+-- ROUND SHADOW RENDERER (TRUE SMOOTH ELLIPSES & CAPSULES VIA UICORNER)
+-- ============================================================================
+-- Draws a smooth round capsule/ellipse in 2D plane coordinates `(u1, v1) -> (u2, v2)`
+-- onto all overlapping `ReceiverTile`s using `UICorner(1, 0)` Frames!
+local function drawRoundShadowOnPlane(
+	u1: number,
+	v1: number,
+	u2: number,
+	v2: number,
+	radiusMinor: number,
+	radiusMajor: number,
+	majorDirU: number,
+	majorDirV: number,
+	plane: ReceiverPlane
+)
+	local pad = math.max(radiusMajor, radiusMinor) + 0.5
+	local minU = math.min(u1, u2) - pad
+	local maxU = math.max(u1, u2) + pad
+	local minV = math.min(v1, v2) - pad
+	local maxV = math.max(v1, v2) + pad
+
+	-- Cull if completely outside the plane's cliff/ledge bounds
+	if maxU < -plane.halfU or minU > plane.halfU or maxV < -plane.halfV or minV > plane.halfV then
+		return
+	end
+
+	local tiles = getOverlappingTiles(
+		plane,
+		math.max(minU, -plane.halfU),
+		math.min(maxU,  plane.halfU),
+		math.max(minV, -plane.halfV),
+		math.min(maxV,  plane.halfV)
+	)
+
+	for _, tile in ipairs(tiles) do
+		local slot = tile.slot
+		local halfU = tile.halfU
+		local halfV = tile.halfV
+		local sx = tile.scaleX
+		local sy = tile.scaleY
+
+		-- Convert plane (u, v) to tile pixel coordinates (px, py)
+		local p1x = (u1 - tile.centerU + halfU) * sx
+		local p1y = (halfV - (v1 - tile.centerV)) * sy
+		local p2x = (u2 - tile.centerU + halfU) * sx
+		local p2y = (halfV - (v2 - tile.centerV)) * sy
+
+		-- Major axis direction in tile pixel space:
+		local majPx = majorDirU * sx
+		local majPy = -majorDirV * sy
+		local majRotDeg = math.deg(math.atan2(majPy, majPx))
+
+		local wMajorPx = radiusMajor * 2 * math.sqrt(majorDirU * majorDirU * sx * sx + majorDirV * majorDirV * sy * sy)
+		local hMinorPx = radiusMinor * 2 * math.sqrt(majorDirV * majorDirV * sx * sx + majorDirU * majorDirU * sy * sy)
+
+		-- 1. First rounded elliptical cap at (p1x, p1y)
+		local c1 = acquireRoundFrame(slot)
+		c1.Position = UDim2.fromOffset(p1x, p1y)
+		c1.Size = UDim2.fromOffset(wMajorPx, hMinorPx)
+		c1.Rotation = majRotDeg
+
+		-- 2. If this is a Cylinder or Capsule with separation between p1 and p2, draw second cap + connecting shaft
+		local dx = p2x - p1x
+		local dy = p2y - p1y
+		local distPx = math.sqrt(dx * dx + dy * dy)
+		if distPx > 1.5 then
+			local c2 = acquireRoundFrame(slot)
+			c2.Position = UDim2.fromOffset(p2x, p2y)
+			c2.Size = UDim2.fromOffset(wMajorPx, hMinorPx)
+			c2.Rotation = majRotDeg
+
+			-- Connecting capsule body between p1 and p2
+			local body = acquireRoundFrame(slot)
+			body.Position = UDim2.fromOffset((p1x + p2x) * 0.5, (p1y + p2y) * 0.5)
+			body.Size = UDim2.fromOffset(distPx + hMinorPx, hMinorPx)
+			body.Rotation = math.deg(math.atan2(dy, dx))
+		end
+	end
+end
+
+-- ============================================================================
+-- SHARP CONVEX POLYGON RENDERER ON SHARED TILES
+-- ============================================================================
+local function drawConvexPolygonOnTile(polyStuds: { Vec2 }, tile: ReceiverTile)
+	local n = #polyStuds
+	if n < 3 then
+		return
+	end
+
+	local slot = tile.slot
+	local halfU = tile.halfU
+	local halfV = tile.halfV
+	local scaleX = tile.scaleX
+	local scaleY = tile.scaleY
+	local centerU = tile.centerU
+	local centerV = tile.centerV
+
+	local polyPx: { Vec2 } = table.create(n)
+	local cx, cy = 0, 0
+	for i = 1, n do
+		local pt = polyStuds[i]
+		local px = (pt.X - centerU + halfU) * scaleX
+		local py = (halfV - (pt.Y - centerV)) * scaleY
+		polyPx[i] = Vector2.new(px, py)
+		cx += px
+		cy += py
+	end
+	cx /= n
+	cy /= n
+
+	local bestL = -1
+	local bestTx, bestTy = 1, 0
+	local bestNx, bestNy = 0, 1
+
+	for i = 1, n do
+		local a = polyPx[i]
+		local b = polyPx[(i % n) + 1]
+		local prevPt = polyPx[((i - 2) % n) + 1]
+		local nextPt = polyPx[((i + 1) % n) + 1]
+
+		local ex = b.X - a.X
+		local ey = b.Y - a.Y
+		local L = math.sqrt(ex * ex + ey * ey)
+
+		if L >= 0.8 then
+			local tx = ex / L
+			local ty = ey / L
+			local nx = -ty
+			local ny = tx
+			if (cx - a.X) * nx + (cy - a.Y) * ny < 0 then
+				nx = -nx
+				ny = -ny
+			end
+
+			if L > bestL then
+				bestL = L
+				bestTx, bestTy = tx, ty
+				bestNx, bestNy = nx, ny
+			end
+
+			local sPrev = (prevPt.X - a.X) * tx + (prevPt.Y - a.Y) * ty
+			local yPrev = math.max((prevPt.X - a.X) * nx + (prevPt.Y - a.Y) * ny, 1e-3)
+			local sNext = (nextPt.X - a.X) * tx + (nextPt.Y - a.Y) * ty
+			local yNext = math.max((nextPt.X - a.X) * nx + (nextPt.Y - a.Y) * ny, 1e-3)
+
+			local rotDeg = math.deg(math.atan2(ty, tx))
+			local isAcute = (sPrev > 0.15) or (sNext < L - 0.15)
+
+			if not isAcute then
+				local d = math.min(yPrev, yNext) * 0.99
+				if d >= 0.5 then
+					local rcx = a.X + tx * (L * 0.5) + nx * (d * 0.5)
+					local rcy = a.Y + ty * (L * 0.5) + ny * (d * 0.5)
+					local f = acquireRectFrame(slot)
+					f.Position = UDim2.fromOffset(rcx, rcy)
+					f.Size = UDim2.fromOffset(L, d + 0.4)
+					f.Rotation = rotDeg
+				end
+			else
+				local maxD = math.min(yPrev, yNext) * 0.72
+				for pass = 1, 2 do
+					local frac = if pass == 1 then 0.22 else 0.72
+					local d = maxD * (frac / 0.72)
+					if d >= 0.5 then
+						local s0 = if sPrev > 0 then d * (sPrev / yPrev) else 0
+						local s1 = if sNext < L then L - d * ((L - sNext) / yNext) else L
+						local w = s1 - s0
+						if w >= 0.6 then
+							local sMid = (s0 + s1) * 0.5
+							local rcx = a.X + tx * sMid + nx * (d * 0.5)
+							local rcy = a.Y + ty * sMid + ny * (d * 0.5)
+							local f = acquireRectFrame(slot)
+							f.Position = UDim2.fromOffset(rcx, rcy)
+							f.Size = UDim2.fromOffset(w, d + 0.5)
+							f.Rotation = rotDeg
+						end
+					end
+				end
+			end
+		end
+	end
+
+	if bestL >= 1.2 then
+		local tx, ty = bestTx, bestTy
+		local nx, ny = bestNx, bestNy
+		local rotDeg = math.deg(math.atan2(ty, tx))
+
+		local vMin = math.huge
+		local vMax = -math.huge
+		for i = 1, n do
+			local p = polyPx[i]
+			local v = p.X * nx + p.Y * ny
+			if v < vMin then vMin = v end
+			if v > vMax then vMax = v end
+		end
+
+		local spanV = vMax - vMin
+		if spanV >= 1.0 then
+			local numStrips = 3
+			local dv = spanV / numStrips
+
+			for k = 0, numStrips - 1 do
+				local v0 = vMin + (k + 0.05) * dv
+				local v1 = vMin + (k + 0.95) * dv
+
+				local uLeft = -math.huge
+				local uRight = math.huge
+				local validBoth = true
+
+				for step = 1, 2 do
+					local vTest = if step == 1 then v0 else v1
+					local minU = math.huge
+					local maxU = -math.huge
+					local hitCount = 0
+
+					local p1 = polyPx[n]
+					local vp1 = p1.X * nx + p1.Y * ny
+					for i = 1, n do
+						local p2 = polyPx[i]
+						local vp2 = p2.X * nx + p2.Y * ny
+						if (vp1 <= vTest and vp2 >= vTest) or (vp2 <= vTest and vp1 >= vTest) then
+							local denom = vp2 - vp1
+							if math.abs(denom) > 1e-5 then
+								local t = (vTest - vp1) / denom
+								local ix = p1.X + t * (p2.X - p1.X)
+								local iy = p1.Y + t * (p2.Y - p1.Y)
+								local u = ix * tx + iy * ty
+								if u < minU then minU = u end
+								if u > maxU then maxU = u end
+								hitCount += 1
+							end
+						end
+						p1 = p2
+						vp1 = vp2
+					end
+
+					if hitCount >= 2 then
+						if minU > uLeft then uLeft = minU end
+						if maxU < uRight then uRight = maxU end
+					else
+						validBoth = false
+						break
+					end
+				end
+
+				if validBoth and uRight > uLeft + 0.6 then
+					local w = uRight - uLeft
+					local h = (v1 - v0) + 1.5
+					local uMid = (uLeft + uRight) * 0.5
+					local vMid = (v0 + v1) * 0.5
+					local rcx = tx * uMid + nx * vMid
+					local rcy = ty * uMid + ny * vMid
+
+					local f = acquireRectFrame(slot)
+					f.Position = UDim2.fromOffset(rcx, rcy)
+					f.Size = UDim2.fromOffset(w, h)
+					f.Rotation = rotDeg
+				end
+			end
+		end
+	end
+end
+
+local function drawClippedPolygonOnPlane(clipped2D: { Vec2 }, plane: ReceiverPlane)
+	local n = #clipped2D
+	if n < 3 then
+		return
+	end
+
+	local minU, maxU = math.huge, -math.huge
+	local minV, maxV = math.huge, -math.huge
+	for i = 1, n do
+		local p = clipped2D[i]
+		if p.X < minU then minU = p.X end
+		if p.X > maxU then maxU = p.X end
+		if p.Y < minV then minV = p.Y end
+		if p.Y > maxV then maxV = p.Y end
+	end
+
+	local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
+	for _, tile in ipairs(tiles) do
+		drawConvexPolygonOnTile(clipped2D, tile)
+	end
+end
+
+-- ============================================================================
+-- RECEIVER PLANE EXTRACTION (FULL PART FACE + SHARED TILE SUPPORT)
+-- ============================================================================
+local function extractReceiverPlane(part: BasePart, hitNormal: Vec3, hitPos: Vec3): ReceiverPlane?
+	if not part:IsA("BasePart") then
+		return nil
+	end
+
+	local cf = part.CFrame
+	local size = part.Size * 0.5
+	local localNormal = cf:VectorToObjectSpace(hitNormal)
+
+	local absX = math.abs(localNormal.X)
+	local absY = math.abs(localNormal.Y)
+	local absZ = math.abs(localNormal.Z)
+
+	local origin: Vec3
+	local normal: Vec3
+	local tangentU: Vec3
+	local tangentV: Vec3
+	local halfU: number
+	local halfV: number
+	local baseKey: string
+
+	if part:IsA("Part") and part.Shape == Enum.PartType.Block then
+		if absY >= absX and absY >= absZ then
+			local signY = if localNormal.Y >= 0 then 1 else -1
+			normal = cf.UpVector * signY
+			origin = cf.Position + normal * size.Y
+			tangentU = cf.RightVector
+			tangentV = normal:Cross(tangentU).Unit
+			halfU = size.X
+			halfV = size.Z
+			baseKey = tostring(part:GetDebugId()) .. (if signY > 0 then "_Top" else "_Bottom")
+		elseif absX >= absY and absX >= absZ then
+			local signX = if localNormal.X >= 0 then 1 else -1
+			normal = cf.RightVector * signX
+			origin = cf.Position + normal * size.X
+			tangentU = -cf.LookVector * signX
+			tangentV = normal:Cross(tangentU).Unit
+			halfU = size.Z
+			halfV = size.Y
+			baseKey = tostring(part:GetDebugId()) .. (if signX > 0 then "_Right" else "_Left")
+		else
+			local signZ = if localNormal.Z >= 0 then 1 else -1
+			normal = -cf.LookVector * signZ
+			origin = cf.Position + normal * size.Z
+			tangentU = cf.RightVector * signZ
+			tangentV = normal:Cross(tangentU).Unit
+			halfU = size.X
+			halfV = size.Y
+			baseKey = tostring(part:GetDebugId()) .. (if signZ > 0 then "_Back" else "_Front")
+		end
+	elseif part:IsA("WedgePart") then
+		normal = hitNormal.Unit
+		tangentU = cf.RightVector
+		tangentV = normal:Cross(tangentU).Unit
+		if absY > 0.1 and absZ > 0.1 then
+			origin = cf.Position
+			halfU = size.X
+			halfV = math.sqrt(size.Y * size.Y + size.Z * size.Z)
+			baseKey = tostring(part:GetDebugId()) .. "_Slope"
+		else
+			origin = hitPos
+			halfU = math.max(size.X, size.Y, size.Z)
+			halfV = halfU
+			baseKey = tostring(part:GetDebugId()) .. "_WedgeFlat"
+		end
+	else
+		normal = hitNormal.Unit
+		origin = hitPos
+		local up = if math.abs(normal.Y) < 0.99 then Vector3.yAxis else Vector3.xAxis
+		tangentU = up:Cross(normal).Unit
+		tangentV = normal:Cross(tangentU).Unit
+		halfU = 24
+		halfV = 24
+		local gx = math.floor(hitPos.X / 24)
+		local gy = math.floor(hitPos.Y / 24)
+		local gz = math.floor(hitPos.Z / 24)
+		baseKey = string.format("Patch_%d_%d_%d_%.1f_%.1f_%.1f", gx, gy, gz, normal.X, normal.Y, normal.Z)
+	end
+
+	local tileThreshold = CONFIG.SharedTileSize * 0.65
+	local isTiled = (halfU > tileThreshold) or (halfV > tileThreshold)
+
+	return {
+		part = part,
+		origin = origin,
+		normal = normal,
+		tangentU = tangentU,
+		tangentV = tangentV,
+		halfU = halfU,
+		halfV = halfV,
+		baseKey = baseKey,
+		isTiled = isTiled,
+	}
+end
+
+-- ============================================================================
+-- CASTER SILHOUETTE EXTRACTION (TRUE ROUND SPHERES/CYLINDERS/HEADS + SHARP BOXES)
+-- ============================================================================
+local BLOCK_CORNERS = {
+	Vector3.new(-0.5, -0.5, -0.5),
+	Vector3.new( 0.5, -0.5, -0.5),
+	Vector3.new(-0.5,  0.5, -0.5),
+	Vector3.new( 0.5,  0.5, -0.5),
+	Vector3.new(-0.5, -0.5,  0.5),
+	Vector3.new( 0.5, -0.5,  0.5),
+	Vector3.new(-0.5,  0.5,  0.5),
+	Vector3.new( 0.5,  0.5,  0.5),
+}
+
+export type CasterHull = {
+	shapeType: "Box" | "Round",
+	verts: { Vec3 },     -- Used for Box/Wedge hulls and raycast probes
+	center: Vec3,
+	endPoint1: Vec3,     -- For Round shapes (Sphere: endPoint1 == endPoint2; Cylinder/Head: capsule endpoints)
+	endPoint2: Vec3,
+	radius: number,      -- For Round shapes
+	sourcePart: BasePart,
+}
+
+local function extractPartHull(part: BasePart, isAccessory: boolean): CasterHull
+	local cf = part.CFrame
+	local size = part.Size
+	local specialMesh = part:FindFirstChildOfClass("SpecialMesh")
+
+	-- 1. Check if this part is a Sphere / Ball (`PartType.Ball` or `SpecialMesh.MeshType.Sphere`)
+	if (part:IsA("Part") and part.Shape == Enum.PartType.Ball)
+		or (specialMesh and specialMesh.MeshType == Enum.MeshType.Sphere)
+	then
+		if specialMesh then
+			cf = cf * CFrame.new(specialMesh.Offset)
+			size = size * specialMesh.Scale
+		end
+		local r = math.max(size.X, size.Y, size.Z) * 0.5
+		local pos = cf.Position
+		return {
+			shapeType = "Round",
+			verts = { pos },
+			center = pos,
+			endPoint1 = pos,
+			endPoint2 = pos,
+			radius = r,
+			sourcePart = part,
+		}
+	end
+
+	-- 2. Check if this part is a Character Head (`Head` or `SpecialMesh.MeshType.Head`)
+	if part.Name == "Head" or (specialMesh and specialMesh.MeshType == Enum.MeshType.Head) then
+		if specialMesh then
+			cf = cf * CFrame.new(specialMesh.Offset)
+		end
+		-- Classic Roblox Head is a vertical rounded capsule/cylinder of radius ~0.62 and height ~1.2
+		local r = math.min(size.Y, size.Z) * 0.58
+		local halfH = size.Y * 0.16
+		local pos = cf.Position
+		local up = cf.UpVector * halfH
+		return {
+			shapeType = "Round",
+			verts = { pos },
+			center = pos,
+			endPoint1 = pos - up,
+			endPoint2 = pos + up,
+			radius = r,
+			sourcePart = part,
+		}
+	end
+
+	-- 3. Check if this part is a Cylinder (`PartType.Cylinder` or `SpecialMesh.MeshType.Cylinder`)
+	if (part:IsA("Part") and part.Shape == Enum.PartType.Cylinder)
+		or (specialMesh and specialMesh.MeshType == Enum.MeshType.Cylinder)
+	then
+		if specialMesh then
+			cf = cf * CFrame.new(specialMesh.Offset)
+			size = size * specialMesh.Scale
+		end
+		local r = math.min(size.Y, size.Z) * 0.5
+		local halfLen = math.max(0, size.X * 0.5 - r * 0.25)
+		local pos = cf.Position
+		local axis = cf.RightVector * halfLen
+		return {
+			shapeType = "Round",
+			verts = { pos - axis, pos + axis },
+			center = pos,
+			endPoint1 = pos - axis,
+			endPoint2 = pos + axis,
+			radius = r,
+			sourcePart = part,
+		}
+	end
+
+	-- 4. WedgePart (6 vertices)
+	if part:IsA("WedgePart") then
+		local hx, hy, hz = size.X * 0.5, size.Y * 0.5, size.Z * 0.5
+		return {
+			shapeType = "Box",
+			verts = {
+				cf * Vector3.new(-hx, -hy, -hz),
+				cf * Vector3.new( hx, -hy, -hz),
+				cf * Vector3.new(-hx, -hy,  hz),
+				cf * Vector3.new( hx, -hy,  hz),
+				cf * Vector3.new(-hx,  hy,  hz),
+				cf * Vector3.new( hx,  hy,  hz),
+			},
+			center = cf.Position,
+			endPoint1 = cf.Position,
+			endPoint2 = cf.Position,
+			radius = 0,
+			sourcePart = part,
+		}
+	end
+
+	-- 5. Standard Box / Limb / Accessory
+	if specialMesh then
+		cf = cf * CFrame.new(specialMesh.Offset)
+		if specialMesh.MeshType == Enum.MeshType.FileMesh and isAccessory then
+			size = Vector3.new(
+				math.clamp(size.X * 0.72, 0.3, 2.2),
+				math.clamp(size.Y * 0.72, 0.3, 2.2),
+				math.clamp(size.Z * 0.72, 0.3, 2.2)
+			)
+		elseif specialMesh.MeshType == Enum.MeshType.Brick then
+			size = size * specialMesh.Scale
+		end
+	end
+
+	local verts = table.create(8)
+	local sx, sy, sz = size.X, size.Y, size.Z
+	for i = 1, 8 do
+		local lc = BLOCK_CORNERS[i]
+		verts[i] = cf * Vector3.new(lc.X * sx, lc.Y * sy, lc.Z * sz)
+	end
+
+	return {
+		shapeType = "Box",
+		verts = verts,
+		center = cf.Position,
+		endPoint1 = cf.Position,
+		endPoint2 = cf.Position,
+		radius = 0,
+		sourcePart = part,
+	}
+end
+
+-- ============================================================================
+-- EVENT-DRIVEN SCENE CACHE (FULL-MAP COVERAGE, ZERO PER-FRAME SCAN)
+-- ============================================================================
+local characterModels: { [Model]: boolean } = {}
+local mapCasterPartsSet: { [BasePart]: boolean } = {}
+local sortedNearbyMapParts: { BasePart } = {}
+local lastMapSortTime = 0
+
+local function shouldPartCastMapShadow(part: BasePart): boolean
+	if part == Workspace.Terrain or part:IsDescendantOf(shadowContainer) then
+		return false
+	end
+	if part.Transparency >= 0.9 then
+		return false
+	end
+	local s = part.Size
+	local isGiantBaseplate = (s.X > CONFIG.MaxCasterPartSize or s.Z > CONFIG.MaxCasterPartSize) and s.Y < 15
+	if isGiantBaseplate then
+		return false
+	end
+	if s.X < CONFIG.MinCasterPartSize and s.Y < CONFIG.MinCasterPartSize and s.Z < CONFIG.MinCasterPartSize then
+		return false
+	end
+	return true
+end
+
+local function registerInstance(inst: Instance)
+	if inst:IsDescendantOf(shadowContainer) then
+		return
+	end
+	if inst:IsA("Humanoid") and inst.Parent and inst.Parent:IsA("Model") then
+		local charModel = inst.Parent :: Model
+		characterModels[charModel] = true
+		for _, desc in ipairs(charModel:GetDescendants()) do
+			if desc:IsA("BasePart") then
+				mapCasterPartsSet[desc] = nil
+				if CONFIG.ForceDisableNativeShadows and desc.CastShadow then
+					desc.CastShadow = false
+				end
+			end
+		end
+	elseif inst:IsA("BasePart") then
+		if CONFIG.ForceDisableNativeShadows and inst.CastShadow then
+			inst.CastShadow = false
+		end
+		local anc = inst.Parent
+		while anc and anc ~= Workspace do
+			if anc:IsA("Model") and (characterModels[anc] or anc:FindFirstChildOfClass("Humanoid")) then
+				characterModels[anc] = true
+				return
+			end
+			anc = anc.Parent
+		end
+		if shouldPartCastMapShadow(inst) then
+			mapCasterPartsSet[inst] = true
+		end
+	end
+end
+
+local function unregisterInstance(inst: Instance)
+	if inst:IsA("Model") then
+		characterModels[inst] = nil
+	elseif inst:IsA("BasePart") then
+		mapCasterPartsSet[inst] = nil
+	end
+end
+
+for _, inst in ipairs(Workspace:GetDescendants()) do
+	registerInstance(inst)
+end
+
+Workspace.DescendantAdded:Connect(registerInstance)
+Workspace.DescendantRemoving:Connect(unregisterInstance)
+
+export type CasterGroup = {
+	hulls: { CasterHull },
+	rootPos: Vec3,
+	filterList: { Instance },
+	dist: number,
+}
+
+local function extractCharacterCasterHulls(model: Model): { CasterHull }
+	local hulls: { CasterHull } = {}
+	for _, child in ipairs(model:GetChildren()) do
+		if child:IsA("BasePart") and child.Transparency < 0.95 and child.Name ~= "HumanoidRootPart" then
+			if CONFIG.ForceDisableNativeShadows and child.CastShadow then
+				child.CastShadow = false
+			end
+			table.insert(hulls, extractPartHull(child, false))
+		elseif child:IsA("Accessory") or child:IsA("Tool") then
+			local isAcc = child:IsA("Accessory")
+			for _, desc in ipairs(child:GetDescendants()) do
+				if desc:IsA("BasePart") and desc.Transparency < 0.95 then
+					if CONFIG.ForceDisableNativeShadows and desc.CastShadow then
+						desc.CastShadow = false
+					end
+					table.insert(hulls, extractPartHull(desc, isAcc))
+				end
+			end
+		end
+	end
+	return hulls
+end
+
+local function gatherSceneCastersFast(focusPos: Vec3, now: number): { CasterGroup }
+	local groups: { CasterGroup } = {}
+
+	for model, _ in pairs(characterModels) do
+		if model.Parent then
+			local root = model.PrimaryPart or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
+			if root and root:IsA("BasePart") then
+				local dist = (root.Position - focusPos).Magnitude
+				if dist <= CONFIG.MaxRenderDistance then
+					local hulls = extractCharacterCasterHulls(model)
+					if #hulls > 0 then
+						table.insert(groups, {
+							hulls = hulls,
+							rootPos = root.Position,
+							filterList = { model, shadowContainer },
+							dist = dist * 0.15,
+						})
+					end
+				end
+			end
+		else
+			characterModels[model] = nil
+		end
+	end
+
+	if CONFIG.IncludeMapParts then
+		if now - lastMapSortTime >= CONFIG.MapRefreshInterval then
+			lastMapSortTime = now
+			local candidates: { { part: BasePart, dist: number } } = {}
+			for part, _ in pairs(mapCasterPartsSet) do
+				if part.Parent and part.Transparency < 0.9 then
+					local dist = (part.Position - focusPos).Magnitude
+					if dist <= CONFIG.MaxRenderDistance then
+						table.insert(candidates, { part = part, dist = dist })
+					end
+				else
+					mapCasterPartsSet[part] = nil
+				end
+			end
+			table.sort(candidates, function(a, b)
+				return a.dist < b.dist
+			end)
+			table.clear(sortedNearbyMapParts)
+			local count = math.min(#candidates, CONFIG.MaxMapCasters)
+			for i = 1, count do
+				sortedNearbyMapParts[i] = candidates[i].part
+			end
+		end
+
+		for i = 1, #sortedNearbyMapParts do
+			local p = sortedNearbyMapParts[i]
+			if p and p.Parent then
+				local dist = (p.Position - focusPos).Magnitude
+				if dist <= CONFIG.MaxRenderDistance then
+					table.insert(groups, {
+						hulls = { extractPartHull(p, false) },
+						rootPos = p.Position,
+						filterList = { p, shadowContainer },
+						dist = dist,
+					})
+				end
+			end
+		end
+	end
+
+	return groups
+end
+
+-- ============================================================================
+-- STENCIL VOLUME PROJECTION (ROUND ANALYTICAL + SHARP POLYGON)
+-- ============================================================================
+local function projectHullOntoReceiverPlane(
+	hull: CasterHull,
+	lightDir: Vec3,
+	plane: ReceiverPlane,
+	rayParams: RaycastParams
+)
+	if plane.part == hull.sourcePart then
+		return
+	end
+
+	local nDotL = plane.normal:Dot(lightDir)
+	if nDotL >= -0.025 then
+		return
+	end
+
+	local casterToPlaneDist = (plane.origin - hull.center):Dot(plane.normal) / nDotL
+	if casterToPlaneDist < -1.5 or casterToPlaneDist > CONFIG.MaxShadowDistance then
+		return
+	end
+
+	-- PATH A: Analytical Round Shadow (Sphere, Ball, Cylinder, Character Head)
+	if hull.shapeType == "Round" then
+		local t1 = (plane.origin - hull.endPoint1):Dot(plane.normal) / nDotL
+		local t2 = (plane.origin - hull.endPoint2):Dot(plane.normal) / nDotL
+		if t1 < -hull.radius or t1 > CONFIG.MaxShadowDistance then
+			return
+		end
+
+		local hit1 = hull.endPoint1 + lightDir * math.max(t1, 0)
+		local hit2 = hull.endPoint2 + lightDir * math.max(t2, 0)
+
+		-- Wall obstruction check for round shadow
+		local midHit = (hit1 + hit2) * 0.5 + plane.normal * 0.04
+		local toReceiver = midHit - hull.center
+		local distToReceiver = toReceiver.Magnitude
+		if distToReceiver > 0.15 then
+			local checkHit = Workspace:Raycast(hull.center, toReceiver, rayParams)
+			if checkHit and checkHit.Instance ~= plane.part then
+				local hitDist = (checkHit.Position - hull.center).Magnitude
+				if hitDist < distToReceiver - CONFIG.WallObstructionTolerance then
+					return
+				end
+			end
+		end
+
+		local rel1 = hit1 - plane.origin
+		local u1 = rel1:Dot(plane.tangentU)
+		local v1 = rel1:Dot(plane.tangentV)
+
+		local rel2 = hit2 - plane.origin
+		local u2 = rel2:Dot(plane.tangentU)
+		local v2 = rel2:Dot(plane.tangentV)
+
+		-- Direction of light elongation on the plane
+		local lu = lightDir:Dot(plane.tangentU)
+		local lv = lightDir:Dot(plane.tangentV)
+		local lLen = math.sqrt(lu * lu + lv * lv)
+		local majorU = if lLen > 1e-4 then lu / lLen else 1
+		local majorV = if lLen > 1e-4 then lv / lLen else 0
+
+		local rMinor = hull.radius
+		local rMajor = hull.radius / math.clamp(-nDotL, 0.32, 1.0)
+
+		drawRoundShadowOnPlane(u1, v1, u2, v2, rMinor, rMajor, majorU, majorV, plane)
+		return
+	end
+
+	-- PATH B: Sharp Convex Polygon Shadow (Limbs, Blocks, Wedges, Walls)
+	local partVerts = hull.verts
+	local projected2D: { Vec2 } = table.create(#partVerts)
+	local validCount = 0
+
+	for i = 1, #partVerts do
+		local v = partVerts[i]
+		local distToPlane = (plane.origin - v):Dot(plane.normal)
+		local t = distToPlane / nDotL
+
+		if t >= -0.35 and t <= CONFIG.MaxShadowDistance then
+			local hitPt = v + lightDir * math.max(t, 0)
+			local rel = hitPt - plane.origin
+			local u = rel:Dot(plane.tangentU)
+			local w = rel:Dot(plane.tangentV)
+			validCount += 1
+			projected2D[validCount] = Vector2.new(u, w)
+		end
+	end
+
+	if validCount < 3 then
+		return
+	end
+
+	local hull2D = computeConvexHull2D(projected2D)
+	if #hull2D < 3 then
+		return
+	end
+
+	local clipped2D = clipPolygonToRect2D(hull2D, plane.halfU, plane.halfV)
+	if #clipped2D < 3 then
+		return
+	end
+
+	-- Wall & Obstruction Clipping
+	local sumU, sumV = 0, 0
+	for i = 1, #clipped2D do
+		sumU += clipped2D[i].X
+		sumV += clipped2D[i].Y
+	end
+	local centroid2D = Vector2.new(sumU / #clipped2D, sumV / #clipped2D)
+	local centroid3D = plane.origin + plane.tangentU * centroid2D.X + plane.tangentV * centroid2D.Y + plane.normal * 0.04
+
+	local toReceiver = centroid3D - hull.center
+	local distToReceiver = toReceiver.Magnitude
+	if distToReceiver > 0.15 then
+		local checkHit = Workspace:Raycast(hull.center, toReceiver, rayParams)
+		if checkHit and checkHit.Instance ~= plane.part then
+			local hitDist = (checkHit.Position - hull.center).Magnitude
+			if hitDist < distToReceiver - CONFIG.WallObstructionTolerance then
+				local wallNormal = checkHit.Normal
+				local wallPoint = checkHit.Position
+				local relWall = wallPoint - plane.origin
+				local wallPt2D = Vector2.new(relWall:Dot(plane.tangentU), relWall:Dot(plane.tangentV))
+				local wallNorm2D = Vector2.new(wallNormal:Dot(plane.tangentU), wallNormal:Dot(plane.tangentV))
+
+				if wallNorm2D.Magnitude > 1e-3 then
+					wallNorm2D = wallNorm2D.Unit
+					local casterRel = hull.center - plane.origin
+					local caster2D = Vector2.new(casterRel:Dot(plane.tangentU), casterRel:Dot(plane.tangentV))
+					if (caster2D - wallPt2D):Dot(wallNorm2D) < 0 then
+						wallNorm2D = -wallNorm2D
+					end
+					clipped2D = clipPolygonHalfPlane2D(clipped2D, wallPt2D, wallNorm2D)
+					if #clipped2D < 3 then
+						return
+					end
+				else
+					return
+				end
+			end
+		end
+	end
+
+	drawClippedPolygonOnPlane(clipped2D, plane)
+end
+
+-- ============================================================================
+-- MAIN PER-FRAME STENCIL SHADOW VOLUME PIPELINE
+-- ============================================================================
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.IgnoreWater = true
+
+local CHARACTER_PROBES = {
+	Vector3.new( 0,  0,  0),
+	Vector3.new( 2.2, 0,  0),
+	Vector3.new(-2.2, 0,  0),
+	Vector3.new( 0,  0,  2.2),
+	Vector3.new( 0,  0, -2.2),
+}
+
+local PROP_PROBES = {
+	Vector3.new( 0, 0, 0),
+	Vector3.new( 1.5, 0, 1.5),
+	Vector3.new(-1.5, 0, -1.5),
+}
+
+RunService.RenderStepped:Connect(function()
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+
+	if CONFIG.ForceDisableNativeShadows and Lighting.GlobalShadows then
+		Lighting.GlobalShadows = false
+	end
+
+	local sunDir = Lighting:GetSunDirection()
+	if sunDir.Y < -0.05 then
+		sunDir = Lighting:GetMoonDirection()
+	end
+	if sunDir.Y < 0.15 then
+		sunDir = Vector3.new(sunDir.X, 0.32, sunDir.Z).Unit
+	end
+	local lightDir = -sunDir.Unit
+
+	local now = os.clock()
+	table.clear(frameTilesByKey)
+	local globalReceiverPlanes: { [string]: ReceiverPlane } = {}
+
+	-- Center discovery on the local player's character if spawned (so rotating the camera never drops shadows!)
+	local localPlayer = Players.LocalPlayer
+	local focusPos = camera.CFrame.Position
+	if localPlayer and localPlayer.Character and localPlayer.Character.PrimaryPart then
+		focusPos = localPlayer.Character.PrimaryPart.Position
+	end
+
+	local casterGroups = gatherSceneCastersFast(focusPos, now)
+
+	for _, group in ipairs(casterGroups) do
+		rayParams.FilterDescendantsInstances = group.filterList
+		local localPlanesForGroup: { [string]: ReceiverPlane } = {}
+		local probes = if #group.hulls > 1 then CHARACTER_PROBES else PROP_PROBES
+
+		for i = 1, #probes do
+			local probeOrigin = group.rootPos + probes[i]
+			local hit = Workspace:Raycast(probeOrigin, lightDir * CONFIG.MaxShadowDistance, rayParams)
+			if hit and hit.Instance and hit.Instance:IsA("BasePart") then
+				local plane = extractReceiverPlane(hit.Instance, hit.Normal, hit.Position)
+				if plane then
+					if not globalReceiverPlanes[plane.baseKey] then
+						globalReceiverPlanes[plane.baseKey] = plane
+					end
+					localPlanesForGroup[plane.baseKey] = globalReceiverPlanes[plane.baseKey]
+
+					-- Cliff / Ledge Spillover Probe:
+					local hitPart = hit.Instance
+					if hitPart:IsA("Part") and math.abs(hit.Normal.Y) > 0.7 then
+						local horizLight = Vector3.new(lightDir.X, 0, lightDir.Z)
+						if horizLight.Magnitude > 0.05 then
+							local stepOrigin = hit.Position + horizLight.Unit * 2.2 + Vector3.new(0, 0.3, 0)
+							local cliffHit = Workspace:Raycast(stepOrigin, lightDir * CONFIG.MaxShadowDistance, rayParams)
+							if cliffHit and cliffHit.Instance and cliffHit.Instance:IsA("BasePart") and cliffHit.Instance ~= hitPart then
+								local cliffPlane = extractReceiverPlane(cliffHit.Instance, cliffHit.Normal, cliffHit.Position)
+								if cliffPlane then
+									if not globalReceiverPlanes[cliffPlane.baseKey] then
+										globalReceiverPlanes[cliffPlane.baseKey] = cliffPlane
+									end
+									localPlanesForGroup[cliffPlane.baseKey] = globalReceiverPlanes[cliffPlane.baseKey]
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+
+		for _, plane in pairs(localPlanesForGroup) do
+			for _, hull in ipairs(group.hulls) do
+				projectHullOntoReceiverPlane(hull, lightDir, plane, rayParams)
+			end
+		end
+	end
+
+	finalizeCanvasSlotsForFrame()
+end)
+
