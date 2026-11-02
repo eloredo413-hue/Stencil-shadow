@@ -1,35 +1,41 @@
 --[[
 	============================================================================
-	ROBLOX REAL-TIME STENCIL SHADOW VOLUME ENGINE (v18 - Exact Silhouette & Instant Map Bake)
+	ROBLOX REAL-TIME STENCIL SHADOW ENGINE (v19 - True Silhouettes & Light Occlusion)
 	============================================================================
-	100% Compatible with ALL Roblox Script Executors & StarterPlayerScripts.
+	Client-side (LocalScript / StarterPlayerScripts / executor). Draws crisp
+	shadows on the surfaces that actually receive the sunlight.
 
-	WHAT WAS FIXED IN v18:
-	1. FIXED MAP OBJECT SHADOWS NOT LOADING OR LOADING SLOWLY:
-	   - Fixed a time-budget bug where `frameStartClock` was measured *before* character
-	     rendering, leaving 0ms for `StaticBakeBudgetSeconds` so static map objects
-	     baked at 0–1 parts per frame. Map baking now has its own dedicated timer and
-	     guarantees at least `25` map parts bake per frame (all 150 map objects load in
-	     ~0.1 seconds!).
-	   - Fixed a critical bug in `computeHullProjectionOnPlane` where multi-part objects
-	     (cafeteria booths, tables above table legs, tiered stages, trees) raycasted
-	     against their own lower horizontal parts (`wallNorm2D.Magnitude == 0`) and hit
-	     `else return nil, nil`, deleting their own floor shadows! Obstruction clipping
-	     now ONLY triggers on tall vertical walls (`abs(normal.Y) < 0.35`).
-	   - Fixed `registerInstance` walking all the way up to `Workspace` and accidentally
-	     treating whole map/room Models that contain an NPC `Humanoid` as a single
-	     character (which excluded the room's furniture from casting shadows).
-	   - Map objects now also automatically project onto the floor planes already
-	     discovered around the player (`globalReceiverPlanes`) in addition to their own
-	     downward and sun-direction raycasts.
-	2. EXACT ANATOMICAL PLAYER SILHOUETTE (Zero Balloon Distortion):
-	   - Fixed double-stretching on character capsules (`rMajor = radius / -nDotL`):
-	     because character 3D bone segments (`p1 -> p2`) ALREADY stretch along `lightDir`
-	     when projected onto the ground, also stretching `rMajor` by `1 / -nDotL` made
-	     shoulders, hips, limbs, and hair balloon up to 3x too fat at angled sun directions.
-	   - Package torsos now use an exact 3D Tapered V-Torso / Hourglass Frustum + tight
-	     deltoid/hip joints so the daylight gap between your waist and arms (and between
-	     both legs) is crisp and true to your actual character model.
+	WHAT'S NEW IN v19
+	1. TRUE PLAYER SILHOUETTES (no more "bunch of cylinders"):
+	   - Each nearby character is mirrored into a black-lit ViewportFrame that
+	     looks down the sun direction. The render is placed on the receiving
+	     surface through a light-aligned SurfaceGui whose canvas is stretched by
+	     exactly 1/cos(incidence) along the light's slope, which is the exact
+	     parallel projection of the character onto that surface.
+	   - The silhouette is the character's real geometry: package / Rthro body
+	     meshes, heads, hair, hats, accessories, tools and transparent textures.
+	   - Far characters (or when the ViewportFrame budget is used up) fall back
+	     to projected oriented boxes of every body part and accessory.
+	2. SHADOWS STAY ON THE FIRST SURFACE THE LIGHT HITS (nothing behind walls):
+	   - Receivers are found by casting rays from every body part along the
+	     light. Surfaces hit first become occluders, and their own shadow region
+	     is subtracted (exact convex polygon difference) from every surface
+	     behind them, so shadows never leak through walls, floors or steps.
+	   - Map shadows sample their footprint back towards the sun and get the
+	     same occluder subtraction.
+	3. WALKING INTO A SHADOW WORKS LIKE A REAL SHADOW:
+	   - Every body part / accessory is tested against the sun. Parts that are
+	     already in another object's shadow are darkened (Highlight fill) and
+	     removed from the character's own silhouette, so your shadow merges into
+	     the building/tree shadow instead of stacking a darker copy on top.
+	4. LONG RANGE: distance-based canvas LOD, off-screen tile culling,
+	   cached primitive state (only changed GUI properties are written) and
+	   larger caster/slot budgets let shadows render far further.
+	5. REFINED LOOK: feathered 1px edges, rounded polygon corners, sun-elevation
+	   fade, softer moon shadows, Terrain receivers and adjustable darkness.
+
+	Override any CONFIG value before running with:
+	    getgenv().StencilShadowConfig = { ShadowDarkness = 0.5, ... }
 ]]
 
 local Players = game:GetService("Players")
@@ -38,9 +44,10 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 
 local VEC3_ZERO = Vector3.new(0, 0, 0)
-local VEC3_ONE  = Vector3.new(1, 1, 1)
-local VEC3_X    = Vector3.new(1, 0, 0)
-local VEC3_Y    = Vector3.new(0, 1, 0)
+local VEC3_ONE = Vector3.new(1, 1, 1)
+local VEC3_X = Vector3.new(1, 0, 0)
+local VEC3_Y = Vector3.new(0, 1, 0)
+local VEC3_Z = Vector3.new(0, 0, 1)
 
 local function clearTable(t)
 	for k in pairs(t) do
@@ -56,40 +63,89 @@ if type(getgenv) == "function" then
 	end
 end
 
+-- Shut down any previously running copy (v18 or v19) before starting.
 if globalEnv._StencilShadowConnection then
 	pcall(function()
 		globalEnv._StencilShadowConnection:Disconnect()
 	end)
 	globalEnv._StencilShadowConnection = nil
 end
+if type(globalEnv._StencilShadowCleanup) == "function" then
+	pcall(globalEnv._StencilShadowCleanup)
+	globalEnv._StencilShadowCleanup = nil
+end
+
+local trackedConnections = {}
+local function track(conn)
+	table.insert(trackedConnections, conn)
+	return conn
+end
 
 -- ============================================================================
 -- ENGINE CONFIGURATION
 -- ============================================================================
 local CONFIG = {
-	ShadowOpacity = 0.35,               -- Uniform stencil darkness (0 = pitch black, 1 = invisible)
-	ShadowColor = Color3.fromRGB(10, 12, 18),
-	PixelsPerStud = 36,                 -- High-DPI crispness for smooth edges & curves
-	MaxCanvasPixels = 1024,             -- Max resolution per shared surface CanvasGroup
-	SurfaceOffset = 0.032,              -- Hover height above floor/wall surfaces
-	SharedTileSize = 36,                -- 36x36 stud tiles for wide-area coverage
-	MaxActiveCanvasSlots = 56,          -- Pool of shared surface slots
-	TileGraceFrames = 5,                -- Temporal persistence against single-frame flicker
-	MaxShadowDistance = 200,            -- Long shadow reach for tall buildings & low sun angles
-	MaxRenderDistance = 420,            -- Wide 420-stud render radius around player/camera
-	MaxMapCasters = 160,                -- Up to 160 nearby map parts casting shadows at once
-	MinBakePerFrame = 28,               -- Guarantee at least 28 uncached map objects bake per frame!
-	StaticBakeBudgetSeconds = 0.0050,   -- Dedicated 5ms budget specifically for map baking
-	MinCasterPartSize = 0.50,           -- Include furniture, booths, chairs, railings, pillars
-	MaxCasterPartSize = 240,            -- Ignore giant baseplates as shadow casters
-	MinReceiverFaceSize = 1.6,          -- Minimum receiver surface dimension for character shadows
-	MinMapReceiverFaceSize = 2.2,       -- Minimum receiver surface dimension for map prop shadows
-	MaxTransparentPartAlpha = 0.50,     -- Hide shadows on transparent parts (glass, barriers, etc.)
-	WallObstructionTolerance = 0.45,    -- Prevents shadows bleeding through solid walls
-	MapRefreshInterval = 0.40,          -- Seconds between re-sorting nearby map parts
-	IncludeMapParts = true,             -- Cast stencil shadows from trees, booths, pillars, buildings
-	ForceDisableNativeShadows = true,   -- Disable blurry native voxel shadows so only crisp stencils show
+	-- Look ---------------------------------------------------------------------
+	ShadowColor = Color3.fromRGB(0, 0, 0),  -- Silhouettes always render black, so keep this dark
+	ShadowDarkness = 0.58,                 -- 0 = invisible, 1 = pitch black
+	SoftEdges = true,                      -- Feathered rim on shadow edges (near tiles only)
+	SoftEdgeTransparency = 0.62,
+	SoftEdgeThickness = 1.25,
+	FadeWithSunElevation = true,           -- Shadows fade out as the sun reaches the horizon
+	MinSunElevation = 0.22,                -- Clamp for a very low sun (keeps shadow length sane)
+	NightShadowStrength = 0.45,            -- Moonlight shadows are softer
+
+	-- Resolution / LOD -----------------------------------------------------------
+	PixelsPerStud = 36,                    -- Full resolution for nearby shadows
+	MinPixelsPerStud = 4,                  -- Resolution for the farthest shadows
+	LodNearDistance = 45,                  -- Full resolution inside this camera distance
+	MaxCanvasPixels = 1024,
+	SharedTileSize = 40,                   -- Large receivers are split into tiles of this size
+	MaxActiveCanvasSlots = 150,
+	TileGraceFrames = 6,                   -- Temporal persistence against single-frame flicker
+	SurfaceOffset = 0.03,                  -- Hover height above receiving surfaces
+	CullOffscreenTiles = true,
+
+	-- Distance -------------------------------------------------------------------
+	MaxShadowDistance = 360,               -- Max distance (along the light) a shadow is thrown
+	MaxRenderDistance = 1400,              -- Map casters considered around the camera/player
+	MaxMapCasters = 480,
+	MapRefreshInterval = 0.35,
+	MinBakePerFrame = 30,
+	StaticBakeBudgetSeconds = 0.006,
+
+	-- Characters -------------------------------------------------------------------
+	MaxCharacterDistance = 700,            -- Characters cast shadows within this distance
+	SilhouetteDistance = 260,              -- Exact ViewportFrame silhouettes within this distance
+	MaxSilhouetteCharacters = 8,
+	MaxSilhouettePlanes = 3,               -- Surfaces per character that get an exact silhouette
+	SilhouettePixelsPerStud = 44,
+	SilhouetteFieldOfView = 1.2,           -- Near-orthographic sun camera
+
+	-- Self shadowing (character standing in another object's shadow) ---------------
+	CharacterSelfShadow = true,
+	SelfShadowStrength = 0.55,
+	MaxSelfShadowHighlights = 24,          -- Roblox renders at most 31 Highlights in total
+	SelfShadowFadeSpeed = 14,
+
+	-- Map parts ----------------------------------------------------------------------
+	IncludeMapParts = true,
+	MinCasterPartSize = 0.5,
+	MaxCasterPartSize = 240,               -- Ignore giant baseplates as shadow casters
+	MinReceiverFaceSize = 1.2,
+	MinMapReceiverFaceSize = 2.0,
+	MaxTransparentPartAlpha = 0.5,         -- More transparent parts neither cast nor receive
+	MaxOccludersPerPlane = 4,
+	ForceDisableNativeShadows = true,      -- Disable blurry native shadows so only stencils show
 }
+
+if type(globalEnv.StencilShadowConfig) == "table" then
+	for k, v in pairs(globalEnv.StencilShadowConfig) do
+		if CONFIG[k] ~= nil and type(CONFIG[k]) == type(v) then
+			CONFIG[k] = v
+		end
+	end
+end
 
 local partUidMap = setmetatable({}, { __mode = "k" })
 local nextPartUid = 0
@@ -104,44 +160,409 @@ local function getPartUid(part)
 	return uid
 end
 
+local originalGlobalShadows = nil
+pcall(function()
+	originalGlobalShadows = Lighting.GlobalShadows
+end)
+
 if CONFIG.ForceDisableNativeShadows then
 	pcall(function()
 		Lighting.GlobalShadows = false
 	end)
 end
 
-local existingContainer = Workspace:FindFirstChild("_StencilShadowEngineV3")
-if existingContainer then
-	pcall(function()
-		existingContainer:Destroy()
-	end)
+for _, name in ipairs({ "_StencilShadowEngineV3", "_StencilShadowEngineV19" }) do
+	local existing = Workspace:FindFirstChild(name)
+	if existing then
+		pcall(function()
+			existing:Destroy()
+		end)
+	end
 end
 
 local shadowContainer = Instance.new("Folder")
-shadowContainer.Name = "_StencilShadowEngineV3"
+shadowContainer.Name = "_StencilShadowEngineV19"
 shadowContainer.Parent = Workspace
 
 -- ============================================================================
--- PERSISTENT VECTOR CANVASGROUP POOL (RIGHT-SIDE-UP + ZIndexBehavior.Sibling)
+-- 2D CONVEX GEOMETRY (hulls, clipping, convex difference, inscribed rects)
+-- ============================================================================
+local function cross2D(a, b, c)
+	return (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X)
+end
+
+local function polygonSignedArea(poly)
+	local n = #poly
+	if n < 3 then
+		return 0
+	end
+	local s = 0
+	local prev = poly[n]
+	for i = 1, n do
+		local p = poly[i]
+		s = s + (prev.X * p.Y - p.X * prev.Y)
+		prev = p
+	end
+	return s * 0.5
+end
+
+local function ensureCCW(poly)
+	if polygonSignedArea(poly) < 0 then
+		local out = {}
+		local n = #poly
+		for i = 1, n do
+			out[i] = poly[n - i + 1]
+		end
+		return out
+	end
+	return poly
+end
+
+local function computeConvexHull2D(input)
+	local n = #input
+	if n < 3 then
+		return input
+	end
+	local pts = {}
+	for i = 1, n do
+		pts[i] = input[i]
+	end
+	table.sort(pts, function(a, b)
+		if math.abs(a.X - b.X) > 1e-6 then
+			return a.X < b.X
+		end
+		return a.Y < b.Y
+	end)
+
+	local lower = {}
+	for i = 1, n do
+		local p = pts[i]
+		while #lower >= 2 and cross2D(lower[#lower - 1], lower[#lower], p) <= 1e-7 do
+			table.remove(lower)
+		end
+		table.insert(lower, p)
+	end
+
+	local upper = {}
+	for i = n, 1, -1 do
+		local p = pts[i]
+		while #upper >= 2 and cross2D(upper[#upper - 1], upper[#upper], p) <= 1e-7 do
+			table.remove(upper)
+		end
+		table.insert(upper, p)
+	end
+
+	table.remove(lower)
+	table.remove(upper)
+	for i = 1, #upper do
+		table.insert(lower, upper[i])
+	end
+	return lower -- counter-clockwise
+end
+
+-- Keeps the part of `poly` where (p - planePt) . planeNormal >= 0
+local function clipPolygonHalfPlane2D(poly, planePt, planeNormal)
+	local count = #poly
+	if count < 3 then
+		return {}
+	end
+	local output = {}
+	local s = poly[count]
+	local sDist = (s - planePt):Dot(planeNormal)
+
+	for i = 1, count do
+		local e = poly[i]
+		local eDist = (e - planePt):Dot(planeNormal)
+		if eDist >= 0 then
+			if sDist < 0 then
+				local t = sDist / (sDist - eDist)
+				table.insert(output, s + (e - s) * t)
+			end
+			table.insert(output, e)
+		elseif sDist >= 0 then
+			local t = sDist / (sDist - eDist)
+			table.insert(output, s + (e - s) * t)
+		end
+		s = e
+		sDist = eDist
+	end
+	return output
+end
+
+local function clipPolygonToBox2D(poly, minX, maxX, minY, maxY)
+	local out = clipPolygonHalfPlane2D(poly, Vector2.new(minX, 0), Vector2.new(1, 0))
+	if #out < 3 then return {} end
+	out = clipPolygonHalfPlane2D(out, Vector2.new(maxX, 0), Vector2.new(-1, 0))
+	if #out < 3 then return {} end
+	out = clipPolygonHalfPlane2D(out, Vector2.new(0, minY), Vector2.new(0, 1))
+	if #out < 3 then return {} end
+	out = clipPolygonHalfPlane2D(out, Vector2.new(0, maxY), Vector2.new(0, -1))
+	if #out < 3 then return {} end
+	return out
+end
+
+local function clipPolygonToRect2D(poly, halfU, halfV)
+	return clipPolygonToBox2D(poly, -halfU, halfU, -halfV, halfV)
+end
+
+-- Intersection of `poly` with the convex polygon `clipPoly` (CCW).
+local function clipPolygonByConvex2D(poly, clipPoly)
+	local out = poly
+	local n = #clipPoly
+	for i = 1, n do
+		local a = clipPoly[i]
+		local b = clipPoly[(i % n) + 1]
+		local d = b - a
+		if d.X * d.X + d.Y * d.Y > 1e-12 then
+			out = clipPolygonHalfPlane2D(out, a, Vector2.new(-d.Y, d.X))
+			if #out < 3 then
+				return {}
+			end
+		end
+	end
+	return out
+end
+
+-- `poly` minus the convex polygon `sub` (CCW) => list of disjoint convex pieces.
+local function subtractConvex2D(poly, sub, minArea)
+	minArea = minArea or 1e-3
+	local pieces = {}
+	local remaining = poly
+	local n = #sub
+	for i = 1, n do
+		local a = sub[i]
+		local b = sub[(i % n) + 1]
+		local d = b - a
+		if d.X * d.X + d.Y * d.Y > 1e-12 then
+			local inward = Vector2.new(-d.Y, d.X)
+			local outside = clipPolygonHalfPlane2D(remaining, a, -inward)
+			if #outside >= 3 and math.abs(polygonSignedArea(outside)) > minArea then
+				table.insert(pieces, outside)
+			end
+			remaining = clipPolygonHalfPlane2D(remaining, a, inward)
+			if #remaining < 3 then
+				return pieces
+			end
+		end
+	end
+	-- Whatever is left is inside `sub` and therefore removed.
+	return pieces
+end
+
+local function polygonBounds2D(poly)
+	local minX, maxX = math.huge, -math.huge
+	local minY, maxY = math.huge, -math.huge
+	for i = 1, #poly do
+		local p = poly[i]
+		if p.X < minX then minX = p.X end
+		if p.X > maxX then maxX = p.X end
+		if p.Y < minY then minY = p.Y end
+		if p.Y > maxY then maxY = p.Y end
+	end
+	return minX, maxX, minY, maxY
+end
+
+-- Horizontal chord [xL, xR] of a convex polygon at height y (nil if missed).
+local function convexChordAtY(poly, y)
+	local xL, xR = math.huge, -math.huge
+	local n = #poly
+	local prev = poly[n]
+	for i = 1, n do
+		local p = poly[i]
+		local y0, y1 = prev.Y, p.Y
+		if (y >= math.min(y0, y1) - 1e-9) and (y <= math.max(y0, y1) + 1e-9) then
+			local x
+			if math.abs(y1 - y0) < 1e-9 then
+				if prev.X < xL then xL = prev.X end
+				if prev.X > xR then xR = prev.X end
+				x = p.X
+			else
+				x = prev.X + (y - y0) * (p.X - prev.X) / (y1 - y0)
+			end
+			if x < xL then xL = x end
+			if x > xR then xR = x end
+		end
+		prev = p
+	end
+	if xL > xR then
+		return nil, nil
+	end
+	return xL, xR
+end
+
+-- Largest (sampled) axis-aligned rectangle inside a convex polygon.
+local function largestInscribedAxisRect2D(poly)
+	local _, _, minY, maxY = polygonBounds2D(poly)
+	if maxY - minY < 1e-4 then
+		return nil
+	end
+	local levels = {}
+	local SAMPLES = 10
+	for i = 0, SAMPLES do
+		table.insert(levels, minY + (maxY - minY) * (i / SAMPLES))
+	end
+	for i = 1, #poly do
+		table.insert(levels, poly[i].Y)
+	end
+	table.sort(levels)
+
+	local chordsL, chordsR, ys = {}, {}, {}
+	for i = 1, #levels do
+		local y = levels[i]
+		if #ys == 0 or y - ys[#ys] > 1e-4 then
+			local xL, xR = convexChordAtY(poly, y)
+			if xL then
+				table.insert(ys, y)
+				chordsL[#ys] = xL
+				chordsR[#ys] = xR
+			end
+		end
+	end
+
+	local best, bx0, bx1, by0, by1 = 0, nil, nil, nil, nil
+	for i = 1, #ys do
+		for j = i + 1, #ys do
+			local x0 = math.max(chordsL[i], chordsL[j])
+			local x1 = math.min(chordsR[i], chordsR[j])
+			if x1 > x0 then
+				local area = (x1 - x0) * (ys[j] - ys[i])
+				if area > best then
+					best, bx0, bx1, by0, by1 = area, x0, x1, ys[i], ys[j]
+				end
+			end
+		end
+	end
+	if not bx0 then
+		return nil
+	end
+	return bx0, bx1, by0, by1, best
+end
+
+local function rectPolygon2D(x0, x1, y0, y1)
+	return {
+		Vector2.new(x0, y0),
+		Vector2.new(x1, y0),
+		Vector2.new(x1, y1),
+		Vector2.new(x0, y1),
+	}
+end
+
+local function isPointInConvex2D(poly, p, tol)
+	tol = tol or 1e-4
+	local n = #poly
+	for i = 1, n do
+		local a = poly[i]
+		local b = poly[(i % n) + 1]
+		if cross2D(a, b, p) < -tol then
+			return false
+		end
+	end
+	return true
+end
+
+-- ============================================================================
+-- CAMERA CACHE (off-screen culling + distance LOD)
+-- ============================================================================
+local camCF = CFrame.new()
+local camPos = VEC3_ZERO
+local camTanX, camTanY = 1, 1
+local camSecX, camSecY = 1.5, 1.5
+
+local function updateCameraCache(camera)
+	camCF = camera.CFrame
+	camPos = camCF.Position
+	local vs = camera.ViewportSize
+	local aspect = vs.X / math.max(vs.Y, 1)
+	camTanY = math.tan(math.rad(camera.FieldOfView) * 0.5)
+	camTanX = camTanY * aspect
+	camSecX = math.sqrt(1 + camTanX * camTanX)
+	camSecY = math.sqrt(1 + camTanY * camTanY)
+end
+
+local function isSphereOnScreen(center, radius)
+	local rel = camCF:PointToObjectSpace(center)
+	local z = -rel.Z
+	if z < -radius then
+		return false
+	end
+	if math.abs(rel.X) - z * camTanX > radius * camSecX then
+		return false
+	end
+	if math.abs(rel.Y) - z * camTanY > radius * camSecY then
+		return false
+	end
+	return true
+end
+
+-- ============================================================================
+-- SHADOW STRENGTH (sun elevation fade, moon shadows)
+-- ============================================================================
+local currentShadowStrength = 1
+local currentGroupTransparency = 1 - CONFIG.ShadowDarkness
+
+local function smoothstep(e0, e1, x)
+	local t = math.clamp((x - e0) / (e1 - e0), 0, 1)
+	return t * t * (3 - 2 * t)
+end
+
+-- ============================================================================
+-- PERSISTENT CANVASGROUP SLOT POOL (cached primitive state + LOD resolution)
 -- ============================================================================
 local canvasSlots = {}
 local keyToSlot = {}
 local currentFrameId = 1
 
-local function createPrimitiveFrame(parent, cornerScale)
+local function createPrimitive(slot, isDisc)
 	local f = Instance.new("Frame")
 	f.AnchorPoint = Vector2.new(0.5, 0.5)
 	f.BackgroundColor3 = CONFIG.ShadowColor
 	f.BackgroundTransparency = 0
 	f.BorderSizePixel = 0
 	f.Visible = false
-	if cornerScale then
+	if isDisc then
 		local corner = Instance.new("UICorner")
-		corner.CornerRadius = UDim.new(cornerScale, 0)
+		corner.CornerRadius = UDim.new(1, 0)
 		corner.Parent = f
 	end
-	f.Parent = parent
-	return f
+	local stroke = nil
+	if CONFIG.SoftEdges then
+		stroke = Instance.new("UIStroke")
+		stroke.Color = CONFIG.ShadowColor
+		stroke.Thickness = CONFIG.SoftEdgeThickness
+		stroke.Transparency = CONFIG.SoftEdgeTransparency
+		stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+		stroke.LineJoinMode = Enum.LineJoinMode.Round
+		stroke.Enabled = slot.softEdges
+		stroke.Parent = f
+	end
+	f.Parent = slot.canvasGroup
+	return { frame = f, stroke = stroke, x = -1e9, y = -1e9, w = -1, h = -1, rot = -1e9, shown = false }
+end
+
+local function setPrimitive(rec, x, y, w, h, rot)
+	if not rec.shown then
+		rec.shown = true
+		rec.frame.Visible = true
+	end
+	if math.abs(rec.x - x) > 0.02 or math.abs(rec.y - y) > 0.02 then
+		rec.x, rec.y = x, y
+		rec.frame.Position = UDim2.new(0, x, 0, y)
+	end
+	if math.abs(rec.w - w) > 0.02 or math.abs(rec.h - h) > 0.02 then
+		rec.w, rec.h = w, h
+		rec.frame.Size = UDim2.new(0, w, 0, h)
+	end
+	if math.abs(rec.rot - rot) > 0.01 then
+		rec.rot = rot
+		rec.frame.Rotation = rot
+	end
+end
+
+local function hidePrimitive(rec)
+	if rec.shown then
+		rec.shown = false
+		rec.frame.Visible = false
+	end
 end
 
 local function createCanvasSlot(slotIndex)
@@ -162,13 +583,12 @@ local function createCanvasSlot(slotIndex)
 	sgui.Face = Enum.NormalId.Front
 	sgui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 	sgui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
-	sgui.CanvasSize = Vector2.new(512, 512)
+	sgui.CanvasSize = Vector2.new(64, 64)
 	sgui.LightInfluence = 0
 	sgui.Brightness = 1
-	sgui.ZOffset = 2
 	sgui.ClipsDescendants = true
 	sgui.ResetOnSpawn = false
-	sgui.Enabled = true
+	sgui.ZOffset = 2
 	sgui.Adornee = part
 	sgui.Parent = part
 
@@ -176,10 +596,9 @@ local function createCanvasSlot(slotIndex)
 	cg.Name = "UnifiedStencilCanvas"
 	cg.BackgroundTransparency = 1
 	cg.BorderSizePixel = 0
-	cg.Position = UDim2.new(0, 0, 0, 0)
 	cg.Size = UDim2.new(1, 0, 1, 0)
 	cg.GroupColor3 = Color3.new(1, 1, 1)
-	cg.GroupTransparency = CONFIG.ShadowOpacity
+	cg.GroupTransparency = currentGroupTransparency
 	cg.Parent = sgui
 
 	part.Parent = shadowContainer
@@ -188,22 +607,38 @@ local function createCanvasSlot(slotIndex)
 		carrierPart = part,
 		surfaceGui = sgui,
 		canvasGroup = cg,
-		rectPool = {},
-		discPool = {},
-		pillPool = {},
+		rects = {},
+		discs = {},
 		activeRects = 0,
 		activeDiscs = 0,
-		activePills = 0,
 		prevRects = 0,
 		prevDiscs = 0,
-		prevPills = 0,
 		boundKey = nil,
 		lastUsedFrame = -1000,
+		softEdges = false,
+		lodPps = nil,
+		groupTransparency = currentGroupTransparency,
+		lastSize = nil,
+		lastCF = nil,
+		lastCanvas = nil,
 	}
 end
 
 for i = 1, CONFIG.MaxActiveCanvasSlots do
 	canvasSlots[i] = createCanvasSlot(i)
+end
+
+local function setSlotSoftEdges(slot, enabled)
+	if slot.softEdges == enabled then
+		return
+	end
+	slot.softEdges = enabled
+	for _, rec in ipairs(slot.rects) do
+		if rec.stroke then rec.stroke.Enabled = enabled end
+	end
+	for _, rec in ipairs(slot.discs) do
+		if rec.stroke then rec.stroke.Enabled = enabled end
+	end
 end
 
 local function acquirePersistentCanvasSlot(tileKey)
@@ -213,20 +648,17 @@ local function acquirePersistentCanvasSlot(tileKey)
 			existing.lastUsedFrame = currentFrameId
 			existing.activeRects = 0
 			existing.activeDiscs = 0
-			existing.activePills = 0
 		end
 		return existing
 	end
 
 	local chosen = nil
 	for i = 1, CONFIG.MaxActiveCanvasSlots do
-		local slot = canvasSlots[i]
-		if slot.boundKey == nil then
-			chosen = slot
+		if canvasSlots[i].boundKey == nil then
+			chosen = canvasSlots[i]
 			break
 		end
 	end
-
 	if not chosen then
 		local oldestFrame = currentFrameId - 1
 		for i = 1, CONFIG.MaxActiveCanvasSlots do
@@ -237,7 +669,6 @@ local function acquirePersistentCanvasSlot(tileKey)
 			end
 		end
 	end
-
 	if not chosen then
 		return nil
 	end
@@ -245,56 +676,52 @@ local function acquirePersistentCanvasSlot(tileKey)
 	if chosen.boundKey then
 		keyToSlot[chosen.boundKey] = nil
 	end
-
 	chosen.boundKey = tileKey
 	chosen.lastUsedFrame = currentFrameId
 	chosen.activeRects = 0
 	chosen.activeDiscs = 0
-	chosen.activePills = 0
+	chosen.lodPps = nil
 	keyToSlot[tileKey] = chosen
 	return chosen
 end
 
-local function acquireRectFromSlot(slot)
+local function acquireRect(slot)
 	local idx = slot.activeRects + 1
 	slot.activeRects = idx
-	local f = slot.rectPool[idx]
-	if not f then
-		f = createPrimitiveFrame(slot.canvasGroup, nil)
-		slot.rectPool[idx] = f
+	local rec = slot.rects[idx]
+	if not rec then
+		rec = createPrimitive(slot, false)
+		slot.rects[idx] = rec
 	end
-	if not f.Visible then
-		f.Visible = true
-	end
-	return f
+	return rec
 end
 
-local function acquireDiscFromSlot(slot)
+local function acquireDisc(slot)
 	local idx = slot.activeDiscs + 1
 	slot.activeDiscs = idx
-	local f = slot.discPool[idx]
-	if not f then
-		f = createPrimitiveFrame(slot.canvasGroup, 1.0)
-		slot.discPool[idx] = f
+	local rec = slot.discs[idx]
+	if not rec then
+		rec = createPrimitive(slot, true)
+		slot.discs[idx] = rec
 	end
-	if not f.Visible then
-		f.Visible = true
-	end
-	return f
+	return rec
 end
 
-local function acquirePillFromSlot(slot)
-	local idx = slot.activePills + 1
-	slot.activePills = idx
-	local f = slot.pillPool[idx]
-	if not f then
-		f = createPrimitiveFrame(slot.canvasGroup, 0.28)
-		slot.pillPool[idx] = f
+local function releaseSlot(slot)
+	for r = 1, slot.prevRects do
+		hidePrimitive(slot.rects[r])
 	end
-	if not f.Visible then
-		f.Visible = true
+	for d = 1, slot.prevDiscs do
+		hidePrimitive(slot.discs[d])
 	end
-	return f
+	slot.activeRects, slot.activeDiscs = 0, 0
+	slot.prevRects, slot.prevDiscs = 0, 0
+	if slot.boundKey then
+		keyToSlot[slot.boundKey] = nil
+	end
+	slot.boundKey = nil
+	slot.lastCF = nil
+	slot.carrierPart.CFrame = CFrame.new(0, -5000, 0)
 end
 
 local function finalizeCanvasSlotsForFrame()
@@ -303,36 +730,19 @@ local function finalizeCanvasSlotsForFrame()
 		if slot.boundKey ~= nil then
 			if slot.lastUsedFrame == currentFrameId then
 				for r = slot.activeRects + 1, slot.prevRects do
-					slot.rectPool[r].Visible = false
+					hidePrimitive(slot.rects[r])
 				end
 				for d = slot.activeDiscs + 1, slot.prevDiscs do
-					slot.discPool[d].Visible = false
-				end
-				for p = slot.activePills + 1, slot.prevPills do
-					slot.pillPool[p].Visible = false
+					hidePrimitive(slot.discs[d])
 				end
 				slot.prevRects = slot.activeRects
 				slot.prevDiscs = slot.activeDiscs
-				slot.prevPills = slot.activePills
+				if math.abs(slot.groupTransparency - currentGroupTransparency) > 0.003 then
+					slot.groupTransparency = currentGroupTransparency
+					slot.canvasGroup.GroupTransparency = currentGroupTransparency
+				end
 			elseif (currentFrameId - slot.lastUsedFrame) > CONFIG.TileGraceFrames then
-				for r = 1, slot.prevRects do
-					slot.rectPool[r].Visible = false
-				end
-				for d = 1, slot.prevDiscs do
-					slot.discPool[d].Visible = false
-				end
-				for p = 1, slot.prevPills do
-					slot.pillPool[p].Visible = false
-				end
-				slot.activeRects = 0
-				slot.activeDiscs = 0
-				slot.activePills = 0
-				slot.prevRects = 0
-				slot.prevDiscs = 0
-				slot.prevPills = 0
-				keyToSlot[slot.boundKey] = nil
-				slot.boundKey = nil
-				slot.carrierPart.CFrame = CFrame.new(0, -5000, 0)
+				releaseSlot(slot)
 			end
 		end
 	end
@@ -340,9 +750,29 @@ local function finalizeCanvasSlotsForFrame()
 end
 
 -- ============================================================================
--- RECEIVER PLANE & SHARED TILE SYSTEM
+-- RECEIVER TILES (shared per surface so overlapping shadows merge uniformly)
 -- ============================================================================
 local frameTilesByKey = {}
+local LOD_LEVELS = { 1.0, 0.66, 0.44, 0.28, 0.17, 0.11 }
+
+local function chooseTilePixelsPerStud(slot, distance)
+	local raw = CONFIG.PixelsPerStud * CONFIG.LodNearDistance / math.max(distance, CONFIG.LodNearDistance)
+	raw = math.max(raw, CONFIG.MinPixelsPerStud)
+	local current = slot.lodPps
+	if current and raw >= current * 0.8 and raw <= current * 1.35 then
+		return current
+	end
+	local chosen = math.max(CONFIG.MinPixelsPerStud, CONFIG.PixelsPerStud * LOD_LEVELS[#LOD_LEVELS])
+	for i = 1, #LOD_LEVELS do
+		local level = math.max(CONFIG.MinPixelsPerStud, CONFIG.PixelsPerStud * LOD_LEVELS[i])
+		if level <= raw * 1.05 then
+			chosen = level
+			break
+		end
+	end
+	slot.lodPps = chosen
+	return chosen
+end
 
 local function getOrCreateReceiverTile(plane, tx, ty)
 	local tileKey = plane.baseKey
@@ -351,18 +781,19 @@ local function getOrCreateReceiverTile(plane, tx, ty)
 	end
 
 	local existing = frameTilesByKey[tileKey]
-	if existing then
-		return existing
+	if existing ~= nil then
+		return existing or nil
 	end
 
 	local tileSize = CONFIG.SharedTileSize
 	local uMin, uMax, vMin, vMax
 	if plane.isTiled then
 		uMin = math.max(-plane.halfU, tx * tileSize - tileSize * 0.5)
-		uMax = math.min( plane.halfU, tx * tileSize + tileSize * 0.5)
+		uMax = math.min(plane.halfU, tx * tileSize + tileSize * 0.5)
 		vMin = math.max(-plane.halfV, ty * tileSize - tileSize * 0.5)
-		vMax = math.min( plane.halfV, ty * tileSize + tileSize * 0.5)
+		vMax = math.min(plane.halfV, ty * tileSize + tileSize * 0.5)
 		if uMax <= uMin + 0.2 or vMax <= vMin + 0.2 then
+			frameTilesByKey[tileKey] = false
 			return nil
 		end
 	else
@@ -370,36 +801,52 @@ local function getOrCreateReceiverTile(plane, tx, ty)
 		vMin, vMax = -plane.halfV, plane.halfV
 	end
 
-	local slot = acquirePersistentCanvasSlot(tileKey)
-	if not slot then
-		return nil
-	end
-
 	local centerU = (uMin + uMax) * 0.5
 	local centerV = (vMin + vMax) * 0.5
 	local halfU = (uMax - uMin) * 0.5
 	local halfV = (vMax - vMin) * 0.5
 	local tileOrigin = plane.origin + plane.tangentU * centerU + plane.tangentV * centerV
+	local tileRadius = math.sqrt(halfU * halfU + halfV * halfV)
 
-	local rawW = math.clamp(math.ceil(halfU * 2 * CONFIG.PixelsPerStud), 32, CONFIG.MaxCanvasPixels)
-	local rawH = math.clamp(math.ceil(halfV * 2 * CONFIG.PixelsPerStud), 32, CONFIG.MaxCanvasPixels)
+	if CONFIG.CullOffscreenTiles and not isSphereOnScreen(tileOrigin, tileRadius) then
+		frameTilesByKey[tileKey] = false
+		return nil
+	end
 
+	local slot = acquirePersistentCanvasSlot(tileKey)
+	if not slot then
+		frameTilesByKey[tileKey] = false
+		return nil
+	end
+
+	local dist = math.max(0, (tileOrigin - camPos).Magnitude - tileRadius * 0.6)
+	local pps = chooseTilePixelsPerStud(slot, dist)
+	setSlotSoftEdges(slot, CONFIG.SoftEdges and pps >= 15)
+
+	local rawW = math.clamp(math.ceil(halfU * 2 * pps), 16, CONFIG.MaxCanvasPixels)
+	local rawH = math.clamp(math.ceil(halfV * 2 * pps), 16, CONFIG.MaxCanvasPixels)
+
+	-- Depth precision drops with distance: lift far shadows a little more.
+	local offset = CONFIG.SurfaceOffset + math.floor(dist / 50) * 0.02
 	local targetSize = Vector3.new(halfU * 2, halfV * 2, 0.01)
 	local targetCF = CFrame.fromMatrix(
-		tileOrigin + plane.normal * CONFIG.SurfaceOffset,
+		tileOrigin + plane.normal * offset,
 		-plane.tangentU,
 		plane.tangentV,
 		-plane.normal
 	)
 	local targetCanvas = Vector2.new(rawW, rawH)
 
-	if slot.carrierPart.Size ~= targetSize then
+	if slot.lastSize ~= targetSize then
+		slot.lastSize = targetSize
 		slot.carrierPart.Size = targetSize
 	end
-	if slot.carrierPart.CFrame ~= targetCF then
+	if slot.lastCF ~= targetCF then
+		slot.lastCF = targetCF
 		slot.carrierPart.CFrame = targetCF
 	end
-	if slot.surfaceGui.CanvasSize ~= targetCanvas then
+	if slot.lastCanvas ~= targetCanvas then
+		slot.lastCanvas = targetCanvas
 		slot.surfaceGui.CanvasSize = targetCanvas
 	end
 
@@ -416,32 +863,30 @@ local function getOrCreateReceiverTile(plane, tx, ty)
 		canvasH = rawH,
 		scaleX = rawW / (halfU * 2),
 		scaleY = rawH / (halfV * 2),
+		pps = pps,
 		key = tileKey,
 		slot = slot,
 		isCircularDisk = plane.isCircularDisk,
 		diskRadius = plane.halfU,
 	}
-
 	frameTilesByKey[tileKey] = tile
 	return tile
 end
 
 local function getOverlappingTiles(plane, minU, maxU, minV, maxV)
+	local tiles = {}
 	if not plane.isTiled then
 		local t = getOrCreateReceiverTile(plane, 0, 0)
 		if t then
-			return { t }
+			tiles[1] = t
 		end
-		return {}
+		return tiles
 	end
-
 	local tileSize = CONFIG.SharedTileSize
 	local tx0 = math.floor((minU + tileSize * 0.5) / tileSize)
 	local tx1 = math.floor((maxU + tileSize * 0.5) / tileSize)
 	local ty0 = math.floor((minV + tileSize * 0.5) / tileSize)
 	local ty1 = math.floor((maxV + tileSize * 0.5) / tileSize)
-
-	local tiles = {}
 	for tx = tx0, tx1 do
 		for ty = ty0, ty1 do
 			local tile = getOrCreateReceiverTile(plane, tx, ty)
@@ -453,485 +898,14 @@ local function getOverlappingTiles(plane, minU, maxU, minV, maxV)
 	return tiles
 end
 
-local function cross2D(a, b, c)
-	return (b.X - a.X) * (c.Y - a.Y) - (b.Y - a.Y) * (c.X - a.X)
-end
-
-local function computeConvexHull2D(pts)
-	local n = #pts
-	if n < 3 then
-		return pts
-	end
-
-	table.sort(pts, function(a, b)
-		if math.abs(a.X - b.X) > 1e-5 then
-			return a.X < b.X
-		end
-		return a.Y < b.Y
-	end)
-
-	local lower = {}
-	for i = 1, n do
-		local p = pts[i]
-		while #lower >= 2 and cross2D(lower[#lower - 1], lower[#lower], p) <= 1e-5 do
-			table.remove(lower)
-		end
-		table.insert(lower, p)
-	end
-
-	local upper = {}
-	for i = n, 1, -1 do
-		local p = pts[i]
-		while #upper >= 2 and cross2D(upper[#upper - 1], upper[#upper], p) <= 1e-5 do
-			table.remove(upper)
-		end
-		table.insert(upper, p)
-	end
-
-	table.remove(lower)
-	table.remove(upper)
-	for i = 1, #upper do
-		table.insert(lower, upper[i])
-	end
-
-	return lower
-end
-
-local function clipPolygonToRect2D(poly, halfU, halfV)
-	if #poly < 3 then
-		return {}
-	end
-
-	local function clipEdge(input, isInside, intersect)
-		local count = #input
-		if count == 0 then
-			return {}
-		end
-		local output = {}
-		local s = input[count]
-		local sInside = isInside(s)
-
-		for i = 1, count do
-			local e = input[i]
-			local eInside = isInside(e)
-
-			if eInside then
-				if not sInside then
-					table.insert(output, intersect(s, e))
-				end
-				table.insert(output, e)
-			elseif sInside then
-				table.insert(output, intersect(s, e))
-			end
-
-			s = e
-			sInside = eInside
-		end
-		return output
-	end
-
-	local out = clipEdge(poly, function(p) return p.X >= -halfU end, function(a, b)
-		local t = (-halfU - a.X) / (b.X - a.X)
-		return Vector2.new(-halfU, a.Y + t * (b.Y - a.Y))
-	end)
-	if #out < 3 then return {} end
-
-	out = clipEdge(out, function(p) return p.X <= halfU end, function(a, b)
-		local t = (halfU - a.X) / (b.X - a.X)
-		return Vector2.new(halfU, a.Y + t * (b.Y - a.Y))
-	end)
-	if #out < 3 then return {} end
-
-	out = clipEdge(out, function(p) return p.Y >= -halfV end, function(a, b)
-		local t = (-halfV - a.Y) / (b.Y - a.Y)
-		return Vector2.new(a.X + t * (b.X - a.X), -halfV)
-	end)
-	if #out < 3 then return {} end
-
-	out = clipEdge(out, function(p) return p.Y <= halfV end, function(a, b)
-		local t = (halfV - a.Y) / (b.Y - a.Y)
-		return Vector2.new(a.X + t * (b.X - a.X), halfV)
-	end)
-
-	return out
-end
-
-local function clipPolygonHalfPlane2D(poly, planePt, planeNormal)
-	local count = #poly
-	if count < 3 then
-		return {}
-	end
-	local output = {}
-	local s = poly[count]
-	local sDist = (s - planePt):Dot(planeNormal)
-
-	for i = 1, count do
-		local e = poly[i]
-		local eDist = (e - planePt):Dot(planeNormal)
-
-		if eDist >= 0 then
-			if sDist < 0 then
-				local t = sDist / (sDist - eDist)
-				table.insert(output, s + (e - s) * t)
-			end
-			table.insert(output, e)
-		elseif sDist >= 0 then
-			local t = sDist / (sDist - eDist)
-			table.insert(output, s + (e - s) * t)
-		end
-
-		s = e
-		sDist = eDist
-	end
-	return output
-end
-
-local OCTAGON_DIRS = {
-	Vector2.new( 1, 0),
-	Vector2.new(-1, 0),
-	Vector2.new( 0, 1),
-	Vector2.new( 0,-1),
-	Vector2.new( 0.7071,  0.7071),
-	Vector2.new(-0.7071,  0.7071),
-	Vector2.new( 0.7071, -0.7071),
-	Vector2.new(-0.7071, -0.7071),
-}
-
-local function clipPolygonToDisk2D(poly, radius)
-	local out = poly
-	for i = 1, #OCTAGON_DIRS do
-		local dir = OCTAGON_DIRS[i]
-		local edgePt = dir * (radius * 0.98)
-		out = clipPolygonHalfPlane2D(out, edgePt, -dir)
-		if #out < 3 then
-			return {}
-		end
-	end
-	return out
-end
-
-local function getSafeBandInterval(polyPx, ox, oy, tx, ty, nx, ny, y0, y1)
-	local uLeft = -math.huge
-	local uRight = math.huge
-	local count = #polyPx
-	local prev = polyPx[count]
-	local ux = prev.X - ox
-	local uy = prev.Y - oy
-	local xPrev = ux * tx + uy * ty
-	local yPrev = ux * nx + uy * ny
-
-	for i = 1, count do
-		local curr = polyPx[i]
-		local cx = curr.X - ox
-		local cy = curr.Y - oy
-		local xCurr = cx * tx + cy * ty
-		local yCurr = cx * nx + cy * ny
-
-		local dy = yCurr - yPrev
-		local dx = xCurr - xPrev
-
-		if math.abs(dy) < 1e-5 then
-			if math.abs(dx) > 1e-5 then
-				if dx > 0 then
-					if yPrev > math.min(y0, y1) + 1e-3 then
-						return false, 0, 0
-					end
-				else
-					if yPrev < math.max(y0, y1) - 1e-3 then
-						return false, 0, 0
-					end
-				end
-			end
-		elseif dy < 0 then
-			local bound0 = xPrev + (y0 - yPrev) * (dx / dy)
-			local bound1 = xPrev + (y1 - yPrev) * (dx / dy)
-			local reqLeft = math.max(bound0, bound1)
-			if reqLeft > uLeft then
-				uLeft = reqLeft
-			end
-		else
-			local bound0 = xPrev + (y0 - yPrev) * (dx / dy)
-			local bound1 = xPrev + (y1 - yPrev) * (dx / dy)
-			local reqRight = math.min(bound0, bound1)
-			if reqRight < uRight then
-				uRight = reqRight
-			end
-		end
-
-		xPrev, yPrev = xCurr, yCurr
-	end
-
-	if uRight <= uLeft + 0.15 then
-		return false, 0, 0
-	end
-	return true, uLeft, uRight
-end
-
 -- ============================================================================
--- VECTOR-SMOOTH 2D CAPSULE / ELLIPTICAL ROUND SHADOW RENDERER
--- ============================================================================
-local function drawEllipse2D(slot, cx, cy, rMinorPx, rMajorPx, majorU, majorV)
-	local dMinor = math.max(2, rMinorPx * 2)
-	local dMajor = math.max(dMinor, rMajorPx * 2)
-	local stretch = dMajor - dMinor
-
-	if stretch <= 2.5 then
-		local disc = acquireDiscFromSlot(slot)
-		local avgD = (dMinor + dMajor) * 0.5
-		disc.Position = UDim2.new(0, cx, 0, cy)
-		disc.Size = UDim2.new(0, avgD, 0, avgD)
-		disc.Rotation = 0
-	else
-		local halfShift = stretch * 0.5
-		local sx = majorU * halfShift
-		local sy = majorV * halfShift
-		local rotDeg = math.deg(math.atan2(majorV, majorU))
-
-		local disc1 = acquireDiscFromSlot(slot)
-		disc1.Position = UDim2.new(0, cx - sx, 0, cy - sy)
-		disc1.Size = UDim2.new(0, dMinor, 0, dMinor)
-		disc1.Rotation = 0
-
-		local disc2 = acquireDiscFromSlot(slot)
-		disc2.Position = UDim2.new(0, cx + sx, 0, cy + sy)
-		disc2.Size = UDim2.new(0, dMinor, 0, dMinor)
-		disc2.Rotation = 0
-
-		local rect = acquireRectFromSlot(slot)
-		rect.Position = UDim2.new(0, cx, 0, cy)
-		rect.Size = UDim2.new(0, stretch + 1.0, 0, dMinor)
-		rect.Rotation = rotDeg
-	end
-end
-
-local function drawRoundShadowOnTile(u1, v1, u2, v2, rMinor, rMajor, rShaft, majorU, majorV, tile)
-	if tile.isCircularDisk then
-		local maxR = tile.diskRadius
-		if (u1 * u1 + v1 * v1) > (maxR * maxR) and (u2 * u2 + v2 * v2) > (maxR * maxR) then
-			return
-		end
-	end
-
-	local slot = tile.slot
-	local scale = (tile.scaleX + tile.scaleY) * 0.5
-	local x1 = (u1 - tile.centerU + tile.halfU) * tile.scaleX
-	local y1 = (-v1 + tile.centerV + tile.halfV) * tile.scaleY
-	local x2 = (u2 - tile.centerU + tile.halfU) * tile.scaleX
-	local y2 = (-v2 + tile.centerV + tile.halfV) * tile.scaleY
-
-	local rMinorPx = math.max(1.5, rMinor * scale)
-	local rMajorPx = math.max(rMinorPx, rMajor * scale)
-	local rShaftPx = math.max(1.5, rShaft * scale)
-
-	local majPxX = majorU
-	local majPxY = -majorV
-
-	drawEllipse2D(slot, x1, y1, rMinorPx, rMajorPx, majPxX, majPxY)
-
-	local dx = x2 - x1
-	local dy = y2 - y1
-	local distPx = math.sqrt(dx * dx + dy * dy)
-	if distPx > 1.0 then
-		drawEllipse2D(slot, x2, y2, rMinorPx, rMajorPx, majPxX, majPxY)
-		local shaft = acquireRectFromSlot(slot)
-		shaft.Position = UDim2.new(0, (x1 + x2) * 0.5, 0, (y1 + y2) * 0.5)
-		shaft.Size = UDim2.new(0, distPx + 1.0, 0, rShaftPx * 2)
-		shaft.Rotation = math.deg(math.atan2(dy, dx))
-	end
-end
-
--- ============================================================================
--- VECTOR-SMOOTH CROSS-HATCHED EXACT POLYGON RASTERIZER
--- ============================================================================
-local function drawConvexPolygonOnTile(polyStuds, tile, isCurvedMesh)
-	local workingPoly = polyStuds
-	if tile.isCircularDisk then
-		workingPoly = clipPolygonToDisk2D(workingPoly, tile.diskRadius)
-		if #workingPoly < 3 then
-			return
-		end
-	end
-
-	local localPoly = {}
-	for i = 1, #workingPoly do
-		local p = workingPoly[i]
-		localPoly[i] = Vector2.new(p.X - tile.centerU, p.Y - tile.centerV)
-	end
-
-	local clipped = clipPolygonToRect2D(localPoly, tile.halfU, tile.halfV)
-	local n = #clipped
-	if n < 3 then
-		return
-	end
-
-	local slot = tile.slot
-	local polyPx = {}
-	for i = 1, n do
-		local p = clipped[n - i + 1]
-		polyPx[i] = Vector2.new(
-			(p.X + tile.halfU) * tile.scaleX,
-			(-p.Y + tile.halfV) * tile.scaleY
-		)
-	end
-
-	if isCurvedMesh then
-		local cx, cy = 0, 0
-		for i = 1, n do
-			cx = cx + polyPx[i].X
-			cy = cy + polyPx[i].Y
-		end
-		cx = cx / n
-		cy = cy / n
-
-		local covXX, covYY, covXY = 0, 0, 0
-		for i = 1, n do
-			local dx = polyPx[i].X - cx
-			local dy = polyPx[i].Y - cy
-			covXX = covXX + dx * dx
-			covYY = covYY + dy * dy
-			covXY = covXY + dx * dy
-		end
-		local theta = 0.5 * math.atan2(2 * covXY, covXX - covYY)
-		local tx, ty = math.cos(theta), math.sin(theta)
-		local nx, ny = -ty, tx
-
-		local minT, maxT = math.huge, -math.huge
-		local minN, maxN = math.huge, -math.huge
-		for i = 1, n do
-			local dx = polyPx[i].X - cx
-			local dy = polyPx[i].Y - cy
-			local pt = dx * tx + dy * ty
-			local pn = dx * nx + dy * ny
-			if pt < minT then minT = pt end
-			if pt > maxT then maxT = pt end
-			if pn < minN then minN = pn end
-			if pn > maxN then maxN = pn end
-		end
-
-		local w = math.max(3, (maxT - minT) * 0.96)
-		local h = math.max(3, (maxN - minN) * 0.96)
-		local midT = 0.5 * (minT + maxT)
-		local midN = 0.5 * (minN + maxN)
-		local pill = acquirePillFromSlot(slot)
-		pill.Position = UDim2.new(0, cx + tx * midT + nx * midN, 0, cy + ty * midT + ny * midN)
-		pill.Size = UDim2.new(0, w, 0, h)
-		pill.Rotation = math.deg(theta)
-		return
-	end
-
-	local bestEdgeLen = -1
-	local bestTx, bestTy = 1, 0
-
-	for i = 1, n do
-		local a = polyPx[i]
-		local b = polyPx[(i % n) + 1]
-		local dx = b.X - a.X
-		local dy = b.Y - a.Y
-		local len = math.sqrt(dx * dx + dy * dy)
-
-		if len > 0.5 then
-			local tx = dx / len
-			local ty = dy / len
-			local nx = -ty
-			local ny = tx
-
-			if len > bestEdgeLen then
-				bestEdgeLen = len
-				bestTx, bestTy = tx, ty
-			end
-
-			local maxY = 0
-			for j = 1, n do
-				local vy = (polyPx[j].X - a.X) * nx + (polyPx[j].Y - a.Y) * ny
-				if vy > maxY then
-					maxY = vy
-				end
-			end
-
-			local rotDeg = math.deg(math.atan2(ty, tx))
-			local d1 = math.clamp(maxY * 0.16, 1.2, 10.0)
-			local d2 = math.clamp(maxY * 0.42, 2.5, 42.0)
-
-			local depths = { d1, d2 }
-			for dIdx = 1, 2 do
-				local d = depths[dIdx]
-				if d <= maxY - 0.1 then
-					local ok, uLeft, uRight = getSafeBandInterval(polyPx, a.X, a.Y, tx, ty, nx, ny, 0, d)
-					if ok then
-						local w = uRight - uLeft
-						local uMid = 0.5 * (uLeft + uRight)
-						local vMid = 0.5 * d
-						local rcx = a.X + tx * uMid + nx * vMid
-						local rcy = a.Y + ty * uMid + ny * vMid
-
-						local f = acquireRectFromSlot(slot)
-						f.Position = UDim2.new(0, rcx, 0, rcy)
-						f.Size = UDim2.new(0, w, 0, d + 0.4)
-						f.Rotation = rotDeg
-					end
-				end
-			end
-		end
-	end
-
-	if bestEdgeLen > 1.5 then
-		local axes = {
-			{ tx = bestTx, ty = bestTy, nx = -bestTy, ny = bestTx },
-			{ tx = -bestTy, ty = bestTx, nx = -bestTx, ny = -bestTy },
-		}
-
-		for aIdx = 1, 2 do
-			local axis = axes[aIdx]
-			local tx, ty, nx, ny = axis.tx, axis.ty, axis.nx, axis.ny
-			local rotDeg = math.deg(math.atan2(ty, tx))
-
-			local vMin = math.huge
-			local vMax = -math.huge
-			for i = 1, n do
-				local v = polyPx[i].X * nx + polyPx[i].Y * ny
-				if v < vMin then vMin = v end
-				if v > vMax then vMax = v end
-			end
-
-			local spanV = vMax - vMin
-			if spanV > 2.0 then
-				local numStrips = 3
-				if aIdx == 1 then
-					numStrips = 4
-				end
-				local dv = spanV / numStrips
-				for k = 0, numStrips - 1 do
-					local v0 = vMin + (k * 0.88 + 0.06) * dv
-					local v1 = vMin + ((k + 1) * 0.88 + 0.06) * dv
-					local ok, uLeft, uRight = getSafeBandInterval(polyPx, 0, 0, tx, ty, nx, ny, v0, v1)
-					if ok then
-						local w = uRight - uLeft
-						local h = (v1 - v0) + 0.4
-						local uMid = 0.5 * (uLeft + uRight)
-						local vMid = 0.5 * (v0 + v1)
-						local rcx = tx * uMid + nx * vMid
-						local rcy = ty * uMid + ny * vMid
-
-						local f = acquireRectFromSlot(slot)
-						f.Position = UDim2.new(0, rcx, 0, rcy)
-						f.Size = UDim2.new(0, w, 0, h)
-						f.Rotation = rotDeg
-					end
-				end
-			end
-		end
-	end
-end
-
--- ============================================================================
--- RECEIVER PLANE EXTRACTION (SUPPORTS ALL BASEPARTS & EXACT HITPOS ELEVATION)
+-- RECEIVER PLANE EXTRACTION (BaseParts, cylinders, wedges & Terrain)
 -- ============================================================================
 local function isPartOpaqueEnough(part)
 	if not part.CanCollide and part.Transparency > 0.05 then
 		return false
 	end
 	return part.Transparency <= CONFIG.MaxTransparentPartAlpha
-		and part.LocalTransparencyModifier <= CONFIG.MaxTransparentPartAlpha
 end
 
 local function getCylinderAxisAndRadius(part)
@@ -939,15 +913,13 @@ local function getCylinderAxisAndRadius(part)
 	local size = part.Size
 
 	if part:IsA("Part") and part.Shape == Enum.PartType.Cylinder then
-		local r = math.min(size.Y, size.Z) * 0.5
-		return true, cf.RightVector, size.X * 0.5, r
+		return true, cf.RightVector, size.X * 0.5, math.min(size.Y, size.Z) * 0.5
 	end
 
 	local cylMesh = part:FindFirstChildOfClass("CylinderMesh")
 	if cylMesh then
 		local s = size * cylMesh.Scale
-		local r = math.min(s.X, s.Z) * 0.5
-		return true, cf.UpVector, s.Y * 0.5, r
+		return true, cf.UpVector, s.Y * 0.5, math.min(s.X, s.Z) * 0.5
 	end
 
 	local spMesh = part:FindFirstChildOfClass("SpecialMesh")
@@ -955,29 +927,59 @@ local function getCylinderAxisAndRadius(part)
 		local s = size * spMesh.Scale
 		if math.abs(s.X - s.Z) < 0.05 and math.abs(s.Y - s.X) > 0.1 then
 			return true, cf.UpVector, s.Y * 0.5, math.min(s.X, s.Z) * 0.5
-		else
-			return true, cf.RightVector, s.X * 0.5, math.min(s.Y, s.Z) * 0.5
 		end
-	end
-
-	if part:IsA("MeshPart") or part:IsA("UnionOperation") then
-		if math.abs(size.X - size.Z) <= size.X * 0.03 then
-			local aspect = size.Y / math.max(size.X, 0.01)
-			if aspect <= 0.4 or aspect >= 2.5 then
-				return true, cf.UpVector, size.Y * 0.5, size.X * 0.5
-			end
-		elseif math.abs(size.Y - size.Z) <= size.Y * 0.03 then
-			local aspect = size.X / math.max(size.Y, 0.01)
-			if aspect <= 0.4 or aspect >= 2.5 then
-				return true, cf.RightVector, size.X * 0.5, size.Y * 0.5
-			end
-		end
+		return true, cf.RightVector, s.X * 0.5, math.min(s.Y, s.Z) * 0.5
 	end
 
 	return false, VEC3_Y, 0, 0
 end
 
+local terrain = Workspace:FindFirstChildOfClass("Terrain")
+local TERRAIN_PATCH_HALF = 14
+local TERRAIN_SNAP = 8
+
+local function makeTangentBasis(normal)
+	local ref = (math.abs(normal.Y) < 0.95) and VEC3_Y or VEC3_X
+	local tangentU = ref:Cross(normal).Unit
+	local tangentV = normal:Cross(tangentU).Unit
+	return tangentU, tangentV
+end
+
+local function extractTerrainPlane(hitNormal, hitPos)
+	local n = hitNormal.Unit
+	local qx = math.floor(n.X * 8 + 0.5)
+	local qy = math.floor(n.Y * 8 + 0.5)
+	local qz = math.floor(n.Z * 8 + 0.5)
+	local qn = Vector3.new(qx, qy, qz)
+	if qn.Magnitude < 1e-3 then
+		return nil
+	end
+	n = qn.Unit
+	local gx = math.floor(hitPos.X / TERRAIN_SNAP + 0.5)
+	local gz = math.floor(hitPos.Z / TERRAIN_SNAP + 0.5)
+	local snapped = Vector3.new(gx * TERRAIN_SNAP, hitPos.Y, gz * TERRAIN_SNAP)
+	local origin = snapped - n * (snapped - hitPos):Dot(n)
+	local gy = math.floor(origin.Y / 2 + 0.5)
+	local tangentU, tangentV = makeTangentBasis(n)
+	return {
+		part = terrain,
+		isTerrain = true,
+		origin = origin,
+		normal = n,
+		tangentU = tangentU,
+		tangentV = tangentV,
+		halfU = TERRAIN_PATCH_HALF,
+		halfV = TERRAIN_PATCH_HALF,
+		baseKey = "T_" .. gx .. "_" .. gy .. "_" .. gz .. "_" .. qx .. "_" .. qy .. "_" .. qz,
+		isTiled = false,
+		isCircularDisk = false,
+	}
+end
+
 local function extractReceiverPlane(part, hitNormal, hitPos, minFaceSpan)
+	if terrain and part == terrain then
+		return extractTerrainPlane(hitNormal, hitPos)
+	end
 	if not part:IsA("BasePart") or not isPartOpaqueEnough(part) then
 		return nil
 	end
@@ -1003,65 +1005,55 @@ local function extractReceiverPlane(part, hitNormal, hitPos, minFaceSpan)
 	local isCircularDisk = false
 	local partUid = getPartUid(part)
 
-	local isCyl, cylAxis, cylHalfH, cylRadius = getCylinderAxisAndRadius(part)
+	local isCyl, cylAxis, _, cylRadius = getCylinderAxisAndRadius(part)
 	if isCyl then
 		local dotAxis = hitNormal:Dot(cylAxis)
-		if math.abs(dotAxis) > 0.75 then
-			local signA = (dotAxis >= 0) and 1 or -1
-			normal = cylAxis * signA
-			local elev = (hitPos - cf.Position):Dot(normal)
-			origin = cf.Position + normal * elev
-			local up = (math.abs(normal.Y) < 0.99) and VEC3_Y or VEC3_X
-			tangentU = up:Cross(normal).Unit
-			tangentV = normal:Cross(tangentU).Unit
-			halfU = cylRadius
-			halfV = cylRadius
-			isCircularDisk = true
-			baseKey = partUid .. (signA > 0 and "_CylTop" or "_CylBot")
-		else
+		if math.abs(dotAxis) <= 0.75 then
 			return nil
 		end
+		local signA = (dotAxis >= 0) and 1 or -1
+		normal = cylAxis * signA
+		origin = cf.Position + normal * (hitPos - cf.Position):Dot(normal)
+		tangentU, tangentV = makeTangentBasis(normal)
+		halfU = cylRadius
+		halfV = cylRadius
+		isCircularDisk = true
+		baseKey = partUid .. (signA > 0 and "_CylTop" or "_CylBot")
 	elseif part:IsA("WedgePart") and absY > 0.1 and absZ > 0.1 then
 		normal = hitNormal.Unit
 		tangentU = cf.RightVector
 		tangentV = normal:Cross(tangentU).Unit
-		local elev = (hitPos - cf.Position):Dot(normal)
-		origin = cf.Position + normal * elev
+		origin = cf.Position + normal * (hitPos - cf.Position):Dot(normal)
 		halfU = size.X
 		halfV = math.sqrt(size.Y * size.Y + size.Z * size.Z)
 		baseKey = partUid .. "_Slope"
+	elseif absY >= absX and absY >= absZ then
+		local signY = (localNormal.Y >= 0) and 1 or -1
+		normal = cf.UpVector * signY
+		origin = cf.Position + normal * (hitPos - cf.Position):Dot(normal)
+		tangentU = cf.RightVector
+		tangentV = normal:Cross(tangentU).Unit
+		halfU = size.X
+		halfV = size.Z
+		baseKey = partUid .. (signY > 0 and "_Top" or "_Bottom")
+	elseif absX >= absY and absX >= absZ then
+		local signX = (localNormal.X >= 0) and 1 or -1
+		normal = cf.RightVector * signX
+		origin = cf.Position + normal * (hitPos - cf.Position):Dot(normal)
+		tangentU = -cf.LookVector * signX
+		tangentV = normal:Cross(tangentU).Unit
+		halfU = size.Z
+		halfV = size.Y
+		baseKey = partUid .. (signX > 0 and "_Right" or "_Left")
 	else
-		if absY >= absX and absY >= absZ then
-			local signY = (localNormal.Y >= 0) and 1 or -1
-			normal = cf.UpVector * signY
-			local elev = (hitPos - cf.Position):Dot(normal)
-			origin = cf.Position + normal * elev
-			tangentU = cf.RightVector
-			tangentV = normal:Cross(tangentU).Unit
-			halfU = size.X
-			halfV = size.Z
-			baseKey = partUid .. (signY > 0 and "_Top" or "_Bottom")
-		elseif absX >= absY and absX >= absZ then
-			local signX = (localNormal.X >= 0) and 1 or -1
-			normal = cf.RightVector * signX
-			local elev = (hitPos - cf.Position):Dot(normal)
-			origin = cf.Position + normal * elev
-			tangentU = -cf.LookVector * signX
-			tangentV = normal:Cross(tangentU).Unit
-			halfU = size.Z
-			halfV = size.Y
-			baseKey = partUid .. (signX > 0 and "_Right" or "_Left")
-		else
-			local signZ = (localNormal.Z >= 0) and 1 or -1
-			normal = -cf.LookVector * signZ
-			local elev = (hitPos - cf.Position):Dot(normal)
-			origin = cf.Position + normal * elev
-			tangentU = cf.RightVector * signZ
-			tangentV = normal:Cross(tangentU).Unit
-			halfU = size.X
-			halfV = size.Y
-			baseKey = partUid .. (signZ > 0 and "_Back" or "_Front")
-		end
+		local signZ = (localNormal.Z >= 0) and 1 or -1
+		normal = -cf.LookVector * signZ
+		origin = cf.Position + normal * (hitPos - cf.Position):Dot(normal)
+		tangentU = cf.RightVector * signZ
+		tangentV = normal:Cross(tangentU).Unit
+		halfU = size.X
+		halfV = size.Y
+		baseKey = partUid .. (signZ > 0 and "_Back" or "_Front")
 	end
 
 	local reqSpan = minFaceSpan or CONFIG.MinReceiverFaceSize
@@ -1069,9 +1061,18 @@ local function extractReceiverPlane(part, hitNormal, hitPos, minFaceSpan)
 		return nil
 	end
 
-	local tileThreshold = CONFIG.SharedTileSize * 0.65
-	local isTiled = (not isCircularDisk) and ((halfU > tileThreshold) or (halfV > tileThreshold))
+	-- Curved meshes (trees, rocks, props) only receive when they are flat slabs;
+	-- otherwise their bounding-box face would float in the air.
+	if not isCircularDisk and (part:IsA("MeshPart")
+		or (spMesh and spMesh.MeshType == Enum.MeshType.FileMesh)) then
+		local ln = cf:VectorToObjectSpace(normal)
+		local thickness = part.Size:Dot(Vector3.new(math.abs(ln.X), math.abs(ln.Y), math.abs(ln.Z)))
+		if thickness > math.max(1.5, 0.15 * math.min(halfU, halfV) * 2) then
+			return nil
+		end
+	end
 
+	local tileThreshold = CONFIG.SharedTileSize * 0.65
 	return {
 		part = part,
 		origin = origin,
@@ -1081,583 +1082,346 @@ local function extractReceiverPlane(part, hitNormal, hitPos, minFaceSpan)
 		halfU = halfU,
 		halfV = halfV,
 		baseKey = baseKey,
-		isTiled = isTiled,
+		isTiled = (not isCircularDisk) and ((halfU > tileThreshold) or (halfV > tileThreshold)),
 		isCircularDisk = isCircularDisk,
 	}
 end
 
+local DISK_SEGMENTS = 20
+local function makeDiskPolygon2D(radius)
+	local poly = {}
+	for i = 0, DISK_SEGMENTS - 1 do
+		local a = (i / DISK_SEGMENTS) * math.pi * 2
+		poly[i + 1] = Vector2.new(math.cos(a) * radius, math.sin(a) * radius)
+	end
+	return poly
+end
+
+-- Receiver outline in its own (u, v) coordinates, counter-clockwise.
+local function getReceiverPolygon2D(plane)
+	if plane.receiverPoly then
+		return plane.receiverPoly
+	end
+	local poly
+	if plane.isCircularDisk then
+		poly = makeDiskPolygon2D(plane.halfU * 0.995)
+	else
+		poly = rectPolygon2D(-plane.halfU, plane.halfU, -plane.halfV, plane.halfV)
+	end
+	plane.receiverPoly = poly
+	return poly
+end
+
+local function worldToPlane2D(plane, p)
+	local rel = p - plane.origin
+	return Vector2.new(rel:Dot(plane.tangentU), rel:Dot(plane.tangentV))
+end
+
+local function planeToWorld(plane, uv)
+	return plane.origin + plane.tangentU * uv.X + plane.tangentV * uv.Y
+end
+
 -- ============================================================================
--- EXACT ANATOMICAL CHARACTER & PACKAGE SILHOUETTE ENGINE (v18)
+-- RASTERIZERS (vector-smooth discs, capsules and convex polygons)
+-- ============================================================================
+local function drawEllipse2D(slot, cx, cy, rMinorPx, rMajorPx, majorU, majorV)
+	local dMinor = math.max(2, rMinorPx * 2)
+	local dMajor = math.max(dMinor, rMajorPx * 2)
+	local stretch = dMajor - dMinor
+	if stretch <= 2.0 then
+		local avgD = (dMinor + dMajor) * 0.5
+		setPrimitive(acquireDisc(slot), cx, cy, avgD, avgD, 0)
+	else
+		local halfShift = stretch * 0.5
+		local sx = majorU * halfShift
+		local sy = majorV * halfShift
+		setPrimitive(acquireDisc(slot), cx - sx, cy - sy, dMinor, dMinor, 0)
+		setPrimitive(acquireDisc(slot), cx + sx, cy + sy, dMinor, dMinor, 0)
+		setPrimitive(acquireRect(slot), cx, cy, stretch + 0.5, dMinor, math.deg(math.atan2(majorV, majorU)))
+	end
+end
+
+local function drawRoundShadowOnTile(r, tile)
+	local slot = tile.slot
+	local scale = (tile.scaleX + tile.scaleY) * 0.5
+	local x1 = (r.u1 - tile.centerU + tile.halfU) * tile.scaleX
+	local y1 = (-r.v1 + tile.centerV + tile.halfV) * tile.scaleY
+	local x2 = (r.u2 - tile.centerU + tile.halfU) * tile.scaleX
+	local y2 = (-r.v2 + tile.centerV + tile.halfV) * tile.scaleY
+
+	local rMinorPx = math.max(1.2, r.rMinor * scale)
+	local rMajorPx = math.max(rMinorPx, r.rMajor * scale)
+	local rShaftPx = math.max(1.2, r.rShaft * scale)
+	local majPxX, majPxY = r.majorU, -r.majorV
+
+	drawEllipse2D(slot, x1, y1, rMinorPx, rMajorPx, majPxX, majPxY)
+	local dx = x2 - x1
+	local dy = y2 - y1
+	local distPx = math.sqrt(dx * dx + dy * dy)
+	if distPx > 1.0 then
+		drawEllipse2D(slot, x2, y2, rMinorPx, rMajorPx, majPxX, majPxY)
+		setPrimitive(acquireRect(slot), (x1 + x2) * 0.5, (y1 + y2) * 0.5, distPx + 0.5, rShaftPx * 2, math.deg(math.atan2(dy, dx)))
+	end
+end
+
+-- Widest band [uLeft, uRight] along an edge axis that stays inside the polygon.
+local function getSafeBandInterval(polyPx, ox, oy, tx, ty, nx, ny, y0, y1)
+	local uLeft = -math.huge
+	local uRight = math.huge
+	local count = #polyPx
+	local prev = polyPx[count]
+	local px, py = prev.X - ox, prev.Y - oy
+	local xPrev = px * tx + py * ty
+	local yPrev = px * nx + py * ny
+
+	for i = 1, count do
+		local curr = polyPx[i]
+		local cx, cy = curr.X - ox, curr.Y - oy
+		local xCurr = cx * tx + cy * ty
+		local yCurr = cx * nx + cy * ny
+		local dy = yCurr - yPrev
+		local dx = xCurr - xPrev
+
+		if math.abs(dy) < 1e-5 then
+			if math.abs(dx) > 1e-5 then
+				if dx > 0 then
+					if yPrev > math.min(y0, y1) + 1e-3 then
+						return false, 0, 0
+					end
+				elseif yPrev < math.max(y0, y1) - 1e-3 then
+					return false, 0, 0
+				end
+			end
+		elseif dy < 0 then
+			local b0 = xPrev + (y0 - yPrev) * (dx / dy)
+			local b1 = xPrev + (y1 - yPrev) * (dx / dy)
+			local reqLeft = math.max(b0, b1)
+			if reqLeft > uLeft then uLeft = reqLeft end
+		else
+			local b0 = xPrev + (y0 - yPrev) * (dx / dy)
+			local b1 = xPrev + (y1 - yPrev) * (dx / dy)
+			local reqRight = math.min(b0, b1)
+			if reqRight < uRight then uRight = reqRight end
+		end
+		xPrev, yPrev = xCurr, yCurr
+	end
+
+	if uRight <= uLeft + 0.15 then
+		return false, 0, 0
+	end
+	return true, uLeft, uRight
+end
+
+local diskClipCache = {}
+local function drawConvexPolygonOnTile(polyStuds, tile)
+	local workingPoly = ensureCCW(polyStuds)
+	if tile.isCircularDisk then
+		local r = tile.diskRadius
+		local disk = diskClipCache[r]
+		if not disk then
+			disk = makeDiskPolygon2D(r * 0.995)
+			diskClipCache[r] = disk
+		end
+		workingPoly = clipPolygonByConvex2D(workingPoly, disk)
+		if #workingPoly < 3 then
+			return
+		end
+	end
+
+	local localPoly = {}
+	for i = 1, #workingPoly do
+		local p = workingPoly[i]
+		localPoly[i] = Vector2.new(p.X - tile.centerU, p.Y - tile.centerV)
+	end
+	local clipped = clipPolygonToRect2D(localPoly, tile.halfU, tile.halfV)
+	local n = #clipped
+	if n < 3 then
+		return
+	end
+
+	-- Pixel space (y down). Reverse order so the polygon stays counter-clockwise.
+	local slot = tile.slot
+	local polyPx = {}
+	for i = 1, n do
+		local p = clipped[n - i + 1]
+		polyPx[i] = Vector2.new((p.X + tile.halfU) * tile.scaleX, (-p.Y + tile.halfV) * tile.scaleY)
+	end
+
+	local minX, maxX, minY, maxY = polygonBounds2D(polyPx)
+	if (maxX - minX) < 2.5 and (maxY - minY) < 2.5 then
+		local d = math.max(maxX - minX, maxY - minY, 1.2)
+		setPrimitive(acquireDisc(slot), (minX + maxX) * 0.5, (minY + maxY) * 0.5, d, d, 0)
+		return
+	end
+
+	local highDetail = tile.pps >= 15
+	local bestEdgeLen = -1
+	local bestTx, bestTy = 1, 0
+	local thinnest = math.huge
+
+	for i = 1, n do
+		local a = polyPx[i]
+		local b = polyPx[(i % n) + 1]
+		local dx = b.X - a.X
+		local dy = b.Y - a.Y
+		local len = math.sqrt(dx * dx + dy * dy)
+		if len > 0.5 then
+			local tx, ty = dx / len, dy / len
+			local nx, ny = -ty, tx
+			if len > bestEdgeLen then
+				bestEdgeLen = len
+				bestTx, bestTy = tx, ty
+			end
+
+			local depthMax = 0
+			for j = 1, n do
+				local vy = (polyPx[j].X - a.X) * nx + (polyPx[j].Y - a.Y) * ny
+				if vy > depthMax then
+					depthMax = vy
+				end
+			end
+			if depthMax < thinnest then
+				thinnest = depthMax
+			end
+
+			local rotDeg = math.deg(math.atan2(ty, tx))
+			local d1 = math.clamp(depthMax * 0.07, 0.9, 6.0)
+			local d2 = math.clamp(depthMax * 0.22, 2.0, 20.0)
+			local d3 = math.clamp(depthMax * 0.48, 3.0, 64.0)
+			local depths = highDetail and { d1, d2, d3 } or { d2, d3 }
+			for dIdx = 1, #depths do
+				local d = depths[dIdx]
+				if d <= depthMax - 0.1 then
+					local ok, uLeft, uRight = getSafeBandInterval(polyPx, a.X, a.Y, tx, ty, nx, ny, 0, d)
+					if ok then
+						local uMid = 0.5 * (uLeft + uRight)
+						local vMid = 0.5 * d
+						setPrimitive(acquireRect(slot),
+							a.X + tx * uMid + nx * vMid,
+							a.Y + ty * uMid + ny * vMid,
+							uRight - uLeft, d + 0.4, rotDeg)
+					end
+				end
+			end
+		end
+	end
+
+	-- Interior strips along the dominant edge and its perpendicular.
+	if bestEdgeLen > 1.5 then
+		for aIdx = 1, 2 do
+			local tx, ty, nx, ny
+			if aIdx == 1 then
+				tx, ty, nx, ny = bestTx, bestTy, -bestTy, bestTx
+			else
+				tx, ty, nx, ny = -bestTy, bestTx, -bestTx, -bestTy
+			end
+			local rotDeg = math.deg(math.atan2(ty, tx))
+			local vMin, vMax = math.huge, -math.huge
+			for i = 1, n do
+				local v = polyPx[i].X * nx + polyPx[i].Y * ny
+				if v < vMin then vMin = v end
+				if v > vMax then vMax = v end
+			end
+			local spanV = vMax - vMin
+			if spanV > 2.0 then
+				local numStrips = (aIdx == 1) and 4 or 3
+				local dv = spanV / numStrips
+				for k = 0, numStrips - 1 do
+					local v0 = vMin + (k * 0.88 + 0.06) * dv
+					local v1 = vMin + ((k + 1) * 0.88 + 0.06) * dv
+					local ok, uLeft, uRight = getSafeBandInterval(polyPx, 0, 0, tx, ty, nx, ny, v0, v1)
+					if ok then
+						local uMid = 0.5 * (uLeft + uRight)
+						local vMid = 0.5 * (v0 + v1)
+						setPrimitive(acquireRect(slot), tx * uMid + nx * vMid, ty * uMid + ny * vMid,
+							uRight - uLeft, (v1 - v0) + 0.4, rotDeg)
+					end
+				end
+			end
+		end
+	end
+
+	-- Rounded corner fillers: a disc tangent to both edges near each vertex
+	-- fills the wedge the edge bands cannot reach.
+	if highDetail and thinnest > 3 then
+		for i = 1, n do
+			local prev = polyPx[((i - 2) % n) + 1]
+			local v = polyPx[i]
+			local nxt = polyPx[(i % n) + 1]
+			local e1 = prev - v
+			local e2 = nxt - v
+			local l1, l2 = e1.Magnitude, e2.Magnitude
+			if l1 > 1 and l2 > 1 then
+				local u1, u2 = e1 / l1, e2 / l2
+				local cosPhi = math.clamp(u1:Dot(u2), -1, 1)
+				local phi = math.acos(cosPhi)
+				if phi > 0.12 and phi < math.pi - 0.08 then
+					local bis = u1 + u2
+					local bl = bis.Magnitude
+					if bl > 1e-4 then
+						local halfSin = math.sin(phi * 0.5)
+						local r = math.min(math.clamp(thinnest * 0.07, 0.9, 6.0) * 1.15,
+							0.45 * math.min(l1, l2) * math.tan(phi * 0.5))
+						if r > 0.6 then
+							local c = v + (bis / bl) * (r / halfSin)
+							setPrimitive(acquireDisc(slot), c.X, c.Y, r * 2, r * 2, 0)
+						end
+					end
+				end
+			end
+		end
+	end
+end
+
+-- ============================================================================
+-- CASTER HULLS (map parts)
 -- ============================================================================
 local BLOCK_CORNERS = {
-	Vector3.new(-0.5, -0.5, -0.5),
-	Vector3.new( 0.5, -0.5, -0.5),
-	Vector3.new(-0.5,  0.5, -0.5),
-	Vector3.new( 0.5,  0.5, -0.5),
-	Vector3.new(-0.5, -0.5,  0.5),
-	Vector3.new( 0.5, -0.5,  0.5),
-	Vector3.new(-0.5,  0.5,  0.5),
-	Vector3.new( 0.5,  0.5,  0.5),
+	Vector3.new(-0.5, -0.5, -0.5), Vector3.new(0.5, -0.5, -0.5),
+	Vector3.new(-0.5, 0.5, -0.5), Vector3.new(0.5, 0.5, -0.5),
+	Vector3.new(-0.5, -0.5, 0.5), Vector3.new(0.5, -0.5, 0.5),
+	Vector3.new(-0.5, 0.5, 0.5), Vector3.new(0.5, 0.5, 0.5),
 }
 
-local function makeBoxHull(part, cf, size, isCurved)
+local function boxCorners(cf, size)
 	local verts = {}
 	local sx, sy, sz = size.X, size.Y, size.Z
 	for i = 1, 8 do
 		local lc = BLOCK_CORNERS[i]
 		verts[i] = cf * Vector3.new(lc.X * sx, lc.Y * sy, lc.Z * sz)
 	end
-	return {
-		shapeType = isCurved and "CurvedBox" or "Box",
-		verts = verts,
-		center = cf.Position,
-		endPoint1 = cf.Position,
-		endPoint2 = cf.Position,
-		cylAxis = VEC3_Y,
-		radius = 0,
-		isCharacterCapsule = false,
-		sourcePart = part,
-	}
+	return verts
 end
 
--- Creates a 3D Tapered Frustum (wide at top Y, narrow at bottom Y) so V-tapered package
--- torsos cast crisp inward-sloping side silhouettes without bloated spheres!
-local function makeTaperedTorsoHull(part, cf, topWidth, botWidth, height, depth)
-	local topX = topWidth * 0.5
-	local botX = botWidth * 0.5
-	local hy = height * 0.5
-	local hz = depth * 0.5
+local function makeBoxHull(part, cf, size)
 	return {
 		shapeType = "Box",
-		verts = {
-			cf * Vector3.new(-topX,  hy, -hz),
-			cf * Vector3.new( topX,  hy, -hz),
-			cf * Vector3.new(-topX,  hy,  hz),
-			cf * Vector3.new( topX,  hy,  hz),
-			cf * Vector3.new(-botX, -hy, -hz),
-			cf * Vector3.new( botX, -hy, -hz),
-			cf * Vector3.new(-botX, -hy,  hz),
-			cf * Vector3.new( botX, -hy,  hz),
-		},
+		verts = boxCorners(cf, size),
 		center = cf.Position,
-		endPoint1 = cf.Position,
-		endPoint2 = cf.Position,
-		cylAxis = VEC3_Y,
-		radius = 0,
-		isCharacterCapsule = false,
+		extent = size.Magnitude * 0.5,
 		sourcePart = part,
 	}
 end
 
-local function makeCapsuleHull(part, p1, p2, radius, isCharCapsule)
-	return {
-		shapeType = "Sphere",
-		verts = { p1, p2 },
-		center = (p1 + p2) * 0.5,
-		endPoint1 = p1,
-		endPoint2 = p2,
-		cylAxis = VEC3_Y,
-		radius = radius,
-		isCharacterCapsule = (isCharCapsule == true),
-		sourcePart = part,
-	}
-end
-
-local R6_SLENDER_MESH_IDS = {
-	[48112070] = true, [86498048] = true, [86500008] = true, [86500036] = true,
-	[86500054] = true, [86500064] = true, [83001137] = true, [83001181] = true,
-	[83001228] = true, [83001266] = true, [83001305] = true,
-}
-
-local R6_MUSCULAR_MESH_IDS = {
-	[86500085] = true, [86500105] = true, [32328397] = true, [32328563] = true,
-	[32328697] = true, [32328759] = true, [32328812] = true,
-}
-
-local characterProfileCache = setmetatable({}, { __mode = "k" })
-
-local function isMeshIdCustomPackage(meshId)
-	if type(meshId) ~= "string" or meshId == "" then
-		return false
-	end
-	local lower = string.lower(meshId)
-	if string.find(lower, "rbxasset://", 1, true) then
-		return false
-	end
-	if string.find(lower, "block", 1, true) then
-		return false
-	end
-	return true
-end
-
-local function classifyR6MeshId(meshId)
-	if type(meshId) ~= "number" or meshId <= 0 then
-		return "Blocky"
-	end
-	if meshId == 139607718 then
-		return "Korblox"
-	end
-	if R6_SLENDER_MESH_IDS[meshId] then
-		return "Slender"
-	end
-	if R6_MUSCULAR_MESH_IDS[meshId] then
-		return "Muscular"
-	end
-	return "Boy20"
-end
-
-local function getSafeMeshId(part)
-	local ok, val = pcall(function()
-		return part.MeshId
-	end)
-	if ok and type(val) == "string" then
-		return val
-	end
-	return ""
-end
-
-local function getCharacterShapeProfile(model)
-	local now = os.clock()
-	local cached = characterProfileCache[model]
-	if cached and (now - cached.lastCheckTime) < 1.0 then
-		return cached
-	end
-
-	local profile = {
-		torsoStyle = "Blocky",
-		leftArmStyle = "Blocky",
-		rightArmStyle = "Blocky",
-		leftLegStyle = "Blocky",
-		rightLegStyle = "Blocky",
-		lastCheckTime = now,
-	}
-
-	local humanoid = model:FindFirstChildOfClass("Humanoid")
-
-	for _, child in ipairs(model:GetChildren()) do
-		if child:IsA("CharacterMesh") and child.MeshId > 0 then
-			local style = classifyR6MeshId(child.MeshId)
-			if child.BodyPart == Enum.BodyPart.Torso then
-				profile.torsoStyle = style
-			elseif child.BodyPart == Enum.BodyPart.LeftArm then
-				profile.leftArmStyle = style
-			elseif child.BodyPart == Enum.BodyPart.RightArm then
-				profile.rightArmStyle = style
-			elseif child.BodyPart == Enum.BodyPart.LeftLeg then
-				profile.leftLegStyle = style
-			elseif child.BodyPart == Enum.BodyPart.RightLeg then
-				profile.rightLegStyle = style
-			end
+-- Visual box of a part (block-mesh scale and mesh offset applied).
+local function getPartVisualBox(part)
+	local cf = part.CFrame
+	local size = part.Size
+	local sp = part:FindFirstChildOfClass("SpecialMesh")
+	if sp then
+		cf = cf * CFrame.new(sp.Offset)
+		if sp.MeshType == Enum.MeshType.Brick or sp.MeshType == Enum.MeshType.Sphere
+			or sp.MeshType == Enum.MeshType.Cylinder or sp.MeshType == Enum.MeshType.Head then
+			size = size * sp.Scale
 		end
-	end
-
-	local r6Torso = model:FindFirstChild("Torso")
-	if r6Torso and r6Torso:IsA("BasePart") then
-		local sp = r6Torso:FindFirstChildOfClass("SpecialMesh")
-		if sp and sp.MeshType == Enum.MeshType.FileMesh and isMeshIdCustomPackage(getSafeMeshId(sp)) then
-			profile.torsoStyle = "Boy20"
-		end
-	end
-
-	local upperTorso = model:FindFirstChild("UpperTorso")
-	local lowerTorso = model:FindFirstChild("LowerTorso")
-	if upperTorso and upperTorso:IsA("BasePart") then
-		local hd = nil
-		if humanoid then
-			hd = humanoid:FindFirstChildOfClass("HumanoidDescription")
-		end
-
-		local function classifyR15Group(hdAssetId, upperPart, lowerPart, endPart, isTorsoGroup)
-			local hasCustomMeshId = false
-			if upperPart and upperPart:IsA("MeshPart") and isMeshIdCustomPackage(getSafeMeshId(upperPart)) then
-				hasCustomMeshId = true
-			end
-
-			local hasGeometricTaper = false
-			if isTorsoGroup and upperPart and lowerPart then
-				local widthRatio = upperPart.Size.X / math.max(0.05, lowerPart.Size.X)
-				local depthDiff = math.abs(upperPart.Size.Z - lowerPart.Size.Z)
-				if math.abs(widthRatio - 1.0) > 0.04 or depthDiff > 0.05 then
-					hasGeometricTaper = true
-				end
-			elseif upperPart and lowerPart then
-				local xDiff1 = math.abs(upperPart.Size.X - lowerPart.Size.X)
-				local zDiff1 = math.abs(upperPart.Size.Z - lowerPart.Size.Z)
-				local xDiff2 = endPart and math.abs(upperPart.Size.X - endPart.Size.X) or 0
-				local zDiff2 = endPart and math.abs(lowerPart.Size.Z - endPart.Size.Z) or 0
-				if xDiff1 > 0.04 or zDiff1 > 0.04 or xDiff2 > 0.04 or zDiff2 > 0.05 then
-					hasGeometricTaper = true
-				end
-			end
-
-			local isPackage = false
-			if type(hdAssetId) == "number" then
-				if hdAssetId > 0 then
-					isPackage = true
-				elseif hasGeometricTaper and hasCustomMeshId then
-					isPackage = true
-				end
-			else
-				isPackage = hasGeometricTaper or hasCustomMeshId
-			end
-
-			if not isPackage then
-				return "Blocky"
-			end
-
-			if hdAssetId == 139607718 or (lowerPart and lowerPart.Size.Y < 0.45 and not isTorsoGroup) then
-				return "Korblox"
-			end
-			if isTorsoGroup and upperPart and lowerPart then
-				local ratio = upperPart.Size.X / math.max(0.1, lowerPart.Size.X)
-				if ratio >= 1.42 then
-					return "Muscular"
-				elseif upperPart.Size.X < 1.55 then
-					return "Slender"
-				end
-			end
-			return "Boy20"
-		end
-
-		local lUpperArm = model:FindFirstChild("LeftUpperArm")
-		local lLowerArm = model:FindFirstChild("LeftLowerArm")
-		local lHand = model:FindFirstChild("LeftHand")
-
-		local rUpperArm = model:FindFirstChild("RightUpperArm")
-		local rLowerArm = model:FindFirstChild("RightLowerArm")
-		local rHand = model:FindFirstChild("RightHand")
-
-		local lUpperLeg = model:FindFirstChild("LeftUpperLeg")
-		local lLowerLeg = model:FindFirstChild("LeftLowerLeg")
-		local lFoot = model:FindFirstChild("LeftFoot")
-
-		local rUpperLeg = model:FindFirstChild("RightUpperLeg")
-		local rLowerLeg = model:FindFirstChild("RightLowerLeg")
-		local rFoot = model:FindFirstChild("RightFoot")
-
-		profile.torsoStyle = classifyR15Group(hd and hd.Torso or nil, upperTorso, lowerTorso, nil, true)
-		profile.leftArmStyle = classifyR15Group(hd and hd.LeftArm or nil, lUpperArm, lLowerArm, lHand, false)
-		profile.rightArmStyle = classifyR15Group(hd and hd.RightArm or nil, rUpperArm, rLowerArm, rHand, false)
-		profile.leftLegStyle = classifyR15Group(hd and hd.LeftLeg or nil, lUpperLeg, lLowerLeg, lFoot, false)
-		profile.rightLegStyle = classifyR15Group(hd and hd.RightLeg or nil, rUpperLeg, rLowerLeg, rFoot, false)
-	end
-
-	characterProfileCache[model] = profile
-	return profile
-end
-
-local function getAttachmentWorldPos(part, attName)
-	local att = part:FindFirstChild(attName)
-	if att and att:IsA("Attachment") then
-		return part.CFrame * att.Position
-	end
-	return nil
-end
-
--- Exact V-Taper / Hourglass Package Torso (Tapered 3D Frustum + Tight Rounded Shoulder/Hip Caps)
-local function addContouredTorsoHulls(hulls, torsoPart, lowerTorsoPart, style)
-	local cf = torsoPart.CFrame
-	local size = torsoPart.Size
-	local pos = cf.Position
-	local right = cf.RightVector
-	local up = cf.UpVector
-
-	if lowerTorsoPart then
-		local lcf = lowerTorsoPart.CFrame
-		local lsize = lowerTorsoPart.Size
-
-		local topW = size.X * (style == "Muscular" and 0.88 or (style == "Slender" and 0.72 or 0.80))
-		local waistW = lsize.X * (style == "Slender" and 0.56 or (style == "Muscular" and 0.62 or 0.66))
-		local depth = size.Z * 0.76
-
-		-- 1) Crisp Tapered 3D Torso Frustum (wide chest tapering to narrow waist so arm-gaps are clear!)
-		table.insert(hulls, makeTaperedTorsoHull(torsoPart, cf, topW, waistW, size.Y * 0.92, depth))
-
-		-- 2) Rounded Shoulder Caps at the top corners of the chest
-		local rShoulder = math.min(size.Y, size.Z) * 0.28
-		local shoulderY = pos + up * (size.Y * 0.28)
-		local halfSpan = math.max(0.1, topW * 0.5 - rShoulder * 0.55)
-		table.insert(hulls, makeCapsuleHull(torsoPart, shoulderY - right * halfSpan, shoulderY + right * halfSpan, rShoulder, true))
-
-		-- 3) LowerTorso Pelvis / Hips
-		local lRight = lcf.RightVector
-		local hipW = lsize.X * (style == "Slender" and 0.76 or 0.70)
-		local rHip = math.min(lsize.Y * 0.95, lsize.Z) * 0.34
-		local hipSpan = math.max(0.08, hipW * 0.5 - rHip * 0.5)
-		table.insert(hulls, makeCapsuleHull(lowerTorsoPart, lcf.Position - lRight * hipSpan, lcf.Position + lRight * hipSpan, rHip, true))
 	else
-		local topW = size.X * (style == "Muscular" and 0.88 or (style == "Slender" and 0.70 or 0.78))
-		local waistW = size.X * (style == "Slender" and 0.50 or (style == "Muscular" and 0.56 or 0.58))
-		local depth = size.Z * 0.76
-
-		-- 1) Tapered Upper-to-Waist 3D Frustum
-		local upperCF = cf * CFrame.new(0, size.Y * 0.08, 0)
-		table.insert(hulls, makeTaperedTorsoHull(torsoPart, upperCF, topW, waistW, size.Y * 0.78, depth))
-
-		-- 2) Rounded Shoulder Bar
-		local rShoulder = size.Z * 0.28
-		local shoulderCenter = pos + up * (size.Y * 0.32)
-		local halfSpan = math.max(0.1, topW * 0.5 - rShoulder * 0.5)
-		table.insert(hulls, makeCapsuleHull(torsoPart, shoulderCenter - right * halfSpan, shoulderCenter + right * halfSpan, rShoulder, true))
-
-		-- 3) Rounded Pelvis / Hips Bar
-		local rHip = size.Z * 0.30
-		local hipCenter = pos - up * (size.Y * 0.36)
-		local hipSpan = size.X * (style == "Slender" and 0.22 or 0.19)
-		table.insert(hulls, makeCapsuleHull(torsoPart, hipCenter - right * hipSpan, hipCenter + right * hipSpan, rHip, true))
-	end
-end
-
-local function extractCharacterCasterHulls(model)
-	local hulls = {}
-	local profile = getCharacterShapeProfile(model)
-
-	local headPart = nil
-	local torsoPart = nil
-	local upperTorsoPart = nil
-	local lowerTorsoPart = nil
-
-	for _, child in ipairs(model:GetChildren()) do
-		if child:IsA("BasePart") and child.Name ~= "HumanoidRootPart" and child.Transparency <= CONFIG.MaxTransparentPartAlpha then
-			if CONFIG.ForceDisableNativeShadows and child.CastShadow then
-				child.CastShadow = false
-			end
-			local name = child.Name
-			if name == "Head" then
-				headPart = child
-			elseif name == "UpperTorso" then
-				upperTorsoPart = child
-				torsoPart = child
-			elseif name == "LowerTorso" then
-				lowerTorsoPart = child
-			elseif name == "Torso" then
-				torsoPart = child
-			end
+		local bm = part:FindFirstChildOfClass("BlockMesh")
+		if bm then
+			cf = cf * CFrame.new(bm.Offset)
+			size = size * bm.Scale
 		end
 	end
-
-	if upperTorsoPart then
-		if profile.torsoStyle == "Blocky" then
-			table.insert(hulls, makeBoxHull(upperTorsoPart, upperTorsoPart.CFrame, upperTorsoPart.Size * Vector3.new(0.88, 1.01, 0.88), false))
-			if lowerTorsoPart then
-				table.insert(hulls, makeBoxHull(lowerTorsoPart, lowerTorsoPart.CFrame, lowerTorsoPart.Size * Vector3.new(0.88, 1.01, 0.88), false))
-			end
-		else
-			addContouredTorsoHulls(hulls, upperTorsoPart, lowerTorsoPart, profile.torsoStyle)
-		end
-	elseif torsoPart then
-		if profile.torsoStyle == "Blocky" then
-			table.insert(hulls, makeBoxHull(torsoPart, torsoPart.CFrame, torsoPart.Size * Vector3.new(0.88, 0.98, 0.88), false))
-		else
-			addContouredTorsoHulls(hulls, torsoPart, nil, profile.torsoStyle)
-		end
-	end
-
-	for _, child in ipairs(model:GetChildren()) do
-		if child:IsA("BasePart") and child.Name ~= "HumanoidRootPart" and child.Transparency <= CONFIG.MaxTransparentPartAlpha then
-			local name = child.Name
-			local cf = child.CFrame
-			local size = child.Size
-
-			if name == "Head" then
-				local sp = child:FindFirstChildOfClass("SpecialMesh")
-				local meshScale = VEC3_ONE
-				if sp then
-					cf = cf * CFrame.new(sp.Offset)
-					meshScale = sp.Scale
-				end
-				local visualDiameter = math.max(size.Y * meshScale.Y, size.Z * meshScale.Z, size.X * 0.54 * meshScale.X)
-				local r = visualDiameter * 0.42
-				local up = cf.UpVector * (visualDiameter * 0.08)
-				table.insert(hulls, makeCapsuleHull(child, cf.Position - up, cf.Position + up, r, true))
-
-			elseif name == "UpperTorso" or name == "LowerTorso" or name == "Torso" then
-				-- Handled above
-
-			elseif name == "Left Arm" or name == "Right Arm" then
-				local isLeft = (name == "Left Arm")
-				local style = isLeft and profile.leftArmStyle or profile.rightArmStyle
-				local sideSign = isLeft and -1 or 1
-
-				if style == "Blocky" then
-					local limbOffset = Vector3.new(sideSign * 0.09, 0, 0)
-					table.insert(hulls, makeBoxHull(child, cf * CFrame.new(limbOffset), size * Vector3.new(0.82, 0.98, 0.84), false))
-				else
-					local right = cf.RightVector * sideSign
-					local up = cf.UpVector
-					local pos = cf.Position + right * 0.08
-					local wMult = 0.84
-					if style == "Slender" then
-						wMult = 0.72
-					elseif style == "Muscular" then
-						wMult = 0.96
-					end
-					local w = math.min(size.X, size.Z) * wMult
-
-					local pShoulder = pos + up * (size.Y * 0.33) + right * 0.03
-					local pElbow = pos + up * (size.Y * 0.02)
-					local pWrist = pos - up * (size.Y * 0.28)
-					local pHand = pos - up * (size.Y * 0.38)
-
-					table.insert(hulls, makeCapsuleHull(child, pShoulder, pElbow, w * 0.31, true))
-					table.insert(hulls, makeCapsuleHull(child, pElbow, pWrist, w * 0.28, true))
-					table.insert(hulls, makeCapsuleHull(child, pWrist, pHand, w * 0.31, true))
-				end
-
-			elseif name == "Left Leg" or name == "Right Leg" then
-				local isLeft = (name == "Left Leg")
-				local style = isLeft and profile.leftLegStyle or profile.rightLegStyle
-				local sideSign = isLeft and -1 or 1
-
-				if style == "Blocky" then
-					local limbOffset = Vector3.new(sideSign * 0.07, 0, 0)
-					table.insert(hulls, makeBoxHull(child, cf * CFrame.new(limbOffset), size * Vector3.new(0.82, 0.98, 0.84), false))
-				elseif style == "Korblox" then
-					local up = cf.UpVector
-					local pHip = cf.Position + up * (size.Y * 0.32)
-					local pPegTip = cf.Position - up * (size.Y * 0.12)
-					table.insert(hulls, makeCapsuleHull(child, pHip, pPegTip, size.X * 0.22, true))
-				else
-					local up = cf.UpVector
-					local look = cf.LookVector
-					local pos = cf.Position + cf.RightVector * (sideSign * 0.05)
-					local w = math.min(size.X, size.Z) * (style == "Slender" and 0.76 or 0.86)
-
-					local pHip = pos + up * (size.Y * 0.33)
-					local pKnee = pos + up * (size.Y * 0.02)
-					local pAnkle = pos - up * (size.Y * 0.35)
-					local pHeel = pos - up * (size.Y * 0.39) - look * (size.Z * 0.08)
-					local pToe = pos - up * (size.Y * 0.39) + look * (size.Z * 0.20)
-
-					table.insert(hulls, makeCapsuleHull(child, pHip, pKnee, w * 0.32, true))
-					table.insert(hulls, makeCapsuleHull(child, pKnee, pAnkle, w * 0.28, true))
-					table.insert(hulls, makeCapsuleHull(child, pHeel, pToe, w * 0.29, true))
-				end
-
-			elseif string.find(name, "Arm", 1, true) or string.find(name, "Hand", 1, true) then
-				local isLeft = (string.find(name, "Left", 1, true) ~= nil)
-				local style = isLeft and profile.leftArmStyle or profile.rightArmStyle
-				local sideSign = isLeft and -1 or 1
-
-				if style == "Blocky" then
-					local limbOffset = Vector3.new(sideSign * 0.07, 0, 0)
-					table.insert(hulls, makeBoxHull(child, cf * CFrame.new(limbOffset), size * Vector3.new(0.84, 1.02, 0.86), false))
-				else
-					local w = math.min(size.X, size.Z)
-					local outShift = cf.RightVector * (sideSign * 0.04)
-					if string.find(name, "UpperArm", 1, true) then
-						local pShoulder = (getAttachmentWorldPos(child, isLeft and "LeftShoulderRigAttachment" or "RightShoulderRigAttachment")
-							or (cf.Position + cf.UpVector * (size.Y * 0.32))) + outShift
-						local pElbow = (getAttachmentWorldPos(child, isLeft and "LeftElbowRigAttachment" or "RightElbowRigAttachment")
-							or (cf.Position - cf.UpVector * (size.Y * 0.34))) + outShift
-						table.insert(hulls, makeCapsuleHull(child, pShoulder, pElbow, w * 0.31, true))
-					elseif string.find(name, "LowerArm", 1, true) then
-						local pElbow = (getAttachmentWorldPos(child, isLeft and "LeftElbowRigAttachment" or "RightElbowRigAttachment")
-							or (cf.Position + cf.UpVector * (size.Y * 0.34))) + outShift
-						local pWrist = (getAttachmentWorldPos(child, isLeft and "LeftWristRigAttachment" or "RightWristRigAttachment")
-							or (cf.Position - cf.UpVector * (size.Y * 0.34))) + outShift
-						table.insert(hulls, makeCapsuleHull(child, pElbow, pWrist, w * 0.29, true))
-					else
-						local rHand = math.max(size.X, size.Z) * 0.32
-						local up = cf.UpVector * (size.Y * 0.12)
-						table.insert(hulls, makeCapsuleHull(child, cf.Position + outShift + up, cf.Position + outShift - up, rHand, true))
-					end
-				end
-
-			elseif string.find(name, "Leg", 1, true) or string.find(name, "Foot", 1, true) then
-				local isLeft = (string.find(name, "Left", 1, true) ~= nil)
-				local style = isLeft and profile.leftLegStyle or profile.rightLegStyle
-				local sideSign = isLeft and -1 or 1
-
-				if style == "Blocky" then
-					local limbOffset = Vector3.new(sideSign * 0.06, 0, 0)
-					table.insert(hulls, makeBoxHull(child, cf * CFrame.new(limbOffset), size * Vector3.new(0.84, 1.02, 0.86), false))
-				elseif style == "Korblox" then
-					if string.find(name, "UpperLeg", 1, true) then
-						local r = math.min(size.X, size.Z) * 0.24
-						local up = cf.UpVector * (size.Y * 0.28)
-						table.insert(hulls, makeCapsuleHull(child, cf.Position + up, cf.Position - up, r, true))
-					end
-				else
-					local w = math.min(size.X, size.Z)
-					local outShift = cf.RightVector * (sideSign * 0.03)
-					if string.find(name, "UpperLeg", 1, true) then
-						local pHip = (getAttachmentWorldPos(child, isLeft and "LeftHipRigAttachment" or "RightHipRigAttachment")
-							or (cf.Position + cf.UpVector * (size.Y * 0.34))) + outShift
-						local pKnee = (getAttachmentWorldPos(child, isLeft and "LeftKneeRigAttachment" or "RightKneeRigAttachment")
-							or (cf.Position - cf.UpVector * (size.Y * 0.34))) + outShift
-						table.insert(hulls, makeCapsuleHull(child, pHip, pKnee, w * 0.32, true))
-					elseif string.find(name, "LowerLeg", 1, true) then
-						local pKnee = (getAttachmentWorldPos(child, isLeft and "LeftKneeRigAttachment" or "RightKneeRigAttachment")
-							or (cf.Position + cf.UpVector * (size.Y * 0.34))) + outShift
-						local pAnkle = (getAttachmentWorldPos(child, isLeft and "LeftAnkleRigAttachment" or "RightAnkleRigAttachment")
-							or (cf.Position - cf.UpVector * (size.Y * 0.34))) + outShift
-						table.insert(hulls, makeCapsuleHull(child, pKnee, pAnkle, w * 0.29, true))
-					else
-						local look = cf.LookVector
-						local rShoe = math.min(size.X, math.max(size.Y * 1.1, size.X * 0.72)) * 0.33
-						local pHeel = cf.Position + outShift - look * (size.Z * 0.18)
-						local pToe = cf.Position + outShift + look * (size.Z * 0.22)
-						table.insert(hulls, makeCapsuleHull(child, pHeel, pToe, rShoe, true))
-					end
-				end
-			else
-				table.insert(hulls, makeBoxHull(child, cf, size, false))
-			end
-
-		elseif child:IsA("Accessory") or child:IsA("Tool") then
-			local isAcc = child:IsA("Accessory")
-			for _, desc in ipairs(child:GetDescendants()) do
-				if desc:IsA("BasePart") and desc.Transparency <= CONFIG.MaxTransparentPartAlpha then
-					if CONFIG.ForceDisableNativeShadows and desc.CastShadow then
-						desc.CastShadow = false
-					end
-					if isAcc then
-						local acf = desc.CFrame
-						local sp = desc:FindFirstChildOfClass("SpecialMesh")
-						if sp then
-							acf = acf * CFrame.new(sp.Offset)
-						end
-						local s = desc.Size
-						local pos = acf.Position
-						local right = acf.RightVector
-						local up = acf.UpVector
-						local look = acf.LookVector
-
-						local isFaceShades = (desc:FindFirstChild("FaceFrontAttachment") ~= nil)
-							or (desc:FindFirstChild("FaceCenterAttachment") ~= nil)
-							or (s.Y < s.X * 0.58 and s.Z < s.X * 0.85)
-
-						if isFaceShades then
-							local halfW = right * (s.X * 0.34)
-							local rShade = math.clamp(s.Y * 0.36, 0.12, 0.28)
-							table.insert(hulls, makeCapsuleHull(desc, pos - halfW, pos + halfW, rShade, true))
-						else
-							-- Tight, proportional hair/hat contour that matches the hair volume without ballooning
-							local rCrown = math.clamp(math.min(s.X, s.Z) * 0.34, 0.24, 0.62)
-							table.insert(hulls, makeCapsuleHull(desc, pos - right * (s.X * 0.16) + up * (s.Y * 0.10), pos + right * (s.X * 0.16) + up * (s.Y * 0.10), rCrown, true))
-							local rLock = rCrown * 0.58
-							local lockDrop = math.clamp(s.Y * 0.18, 0.10, 0.48)
-							table.insert(hulls, makeCapsuleHull(desc, pos - right * (s.X * 0.25) + up * (s.Y * 0.06), pos - right * (s.X * 0.28) - up * lockDrop, rLock, true))
-							table.insert(hulls, makeCapsuleHull(desc, pos + right * (s.X * 0.25) + up * (s.Y * 0.06), pos + right * (s.X * 0.28) - up * lockDrop, rLock, true))
-							table.insert(hulls, makeCapsuleHull(desc, pos + look * (s.Z * 0.18) - right * (s.X * 0.16), pos + look * (s.Z * 0.18) + right * (s.X * 0.16), rLock * 0.78, true))
-						end
-					else
-						table.insert(hulls, makeBoxHull(desc, desc.CFrame, desc.Size, false))
-					end
-				end
-			end
-		end
-	end
-
-	if headPart and torsoPart then
-		local torsoTop = torsoPart.Position + torsoPart.CFrame.UpVector * (torsoPart.Size.Y * 0.42)
-		local headCenter = headPart.Position
-		local neckRadius = math.min(headPart.Size.Y, headPart.Size.Z) * 0.20
-		table.insert(hulls, makeCapsuleHull(headPart, torsoTop, headCenter, neckRadius, true))
-	end
-
-	return hulls
+	return cf, size
 end
 
 local function extractMapPartHull(part)
@@ -1666,14 +1430,21 @@ local function extractMapPartHull(part)
 	local specialMesh = part:FindFirstChildOfClass("SpecialMesh")
 
 	if (part:IsA("Part") and part.Shape == Enum.PartType.Ball)
-		or (specialMesh and specialMesh.MeshType == Enum.MeshType.Sphere)
-	then
+		or (specialMesh and specialMesh.MeshType == Enum.MeshType.Sphere) then
 		if specialMesh then
 			cf = cf * CFrame.new(specialMesh.Offset)
 			size = size * specialMesh.Scale
 		end
 		local r = math.max(size.X, size.Y, size.Z) * 0.5
-		return makeCapsuleHull(part, cf.Position, cf.Position, r, false)
+		return {
+			shapeType = "Sphere",
+			endPoint1 = cf.Position,
+			endPoint2 = cf.Position,
+			center = cf.Position,
+			radius = r,
+			extent = r,
+			sourcePart = part,
+		}
 	end
 
 	local isCyl, cylAxis, cylHalfH, cylRadius = getCylinderAxisAndRadius(part)
@@ -1682,13 +1453,12 @@ local function extractMapPartHull(part)
 		local step = cylAxis * cylHalfH
 		return {
 			shapeType = "Cylinder",
-			verts = { pos - step, pos + step },
-			center = pos,
 			endPoint1 = pos - step,
 			endPoint2 = pos + step,
+			center = pos,
 			cylAxis = cylAxis,
 			radius = cylRadius,
-			isCharacterCapsule = false,
+			extent = math.sqrt(cylHalfH * cylHalfH + cylRadius * cylRadius),
 			sourcePart = part,
 		}
 	end
@@ -1698,47 +1468,306 @@ local function extractMapPartHull(part)
 		return {
 			shapeType = "Box",
 			verts = {
-				cf * Vector3.new(-hx, -hy, -hz),
-				cf * Vector3.new( hx, -hy, -hz),
-				cf * Vector3.new(-hx, -hy,  hz),
-				cf * Vector3.new( hx, -hy,  hz),
-				cf * Vector3.new(-hx,  hy,  hz),
-				cf * Vector3.new( hx,  hy,  hz),
+				cf * Vector3.new(-hx, -hy, -hz), cf * Vector3.new(hx, -hy, -hz),
+				cf * Vector3.new(-hx, -hy, hz), cf * Vector3.new(hx, -hy, hz),
+				cf * Vector3.new(-hx, hy, hz), cf * Vector3.new(hx, hy, hz),
 			},
 			center = cf.Position,
-			endPoint1 = cf.Position,
-			endPoint2 = cf.Position,
-			cylAxis = VEC3_Y,
-			radius = 0,
-			isCharacterCapsule = false,
+			extent = size.Magnitude * 0.5,
 			sourcePart = part,
 		}
 	end
 
-	local isCurvedMapPart = part:IsA("MeshPart") or part:IsA("UnionOperation") or part:IsA("CornerWedgePart")
+	local isCurved = part:IsA("MeshPart") or part:IsA("UnionOperation")
 	if specialMesh then
 		cf = cf * CFrame.new(specialMesh.Offset)
-		if specialMesh.MeshType == Enum.MeshType.FileMesh or specialMesh.MeshType == Enum.MeshType.Torso then
-			isCurvedMapPart = true
-		elseif specialMesh.MeshType == Enum.MeshType.Brick then
+		if specialMesh.MeshType == Enum.MeshType.Brick then
 			size = size * specialMesh.Scale
+		else
+			isCurved = true
 		end
 	end
-
-	return makeBoxHull(part, cf, size, isCurvedMapPart)
+	if isCurved then
+		-- Mesh bounding boxes overestimate the visible volume slightly.
+		size = size * 0.92
+	end
+	return makeBoxHull(part, cf, size)
 end
 
 -- ============================================================================
--- EVENT-DRIVEN SCENE CACHE & FAST MULTI-PART MAP BAKING
+-- LIGHT PROJECTION ONTO A RECEIVER PLANE
+-- ============================================================================
+local function sampleEllipseInto(out, cu, cv, majorU, majorV, rMajor, rMinor, segments)
+	local minU, minV = -majorV, majorU
+	for i = 0, segments - 1 do
+		local a = (i / segments) * math.pi * 2
+		local ca, sa = math.cos(a) * rMajor, math.sin(a) * rMinor
+		table.insert(out, Vector2.new(cu + majorU * ca + minU * sa, cv + majorV * ca + minV * sa))
+	end
+end
+
+local function finishRoundProjection(proj)
+	local pts = {}
+	sampleEllipseInto(pts, proj.u1, proj.v1, proj.majorU, proj.majorV, proj.rMajor, proj.rMinor, 14)
+	if (proj.u2 - proj.u1) ^ 2 + (proj.v2 - proj.v1) ^ 2 > 1e-4 then
+		sampleEllipseInto(pts, proj.u2, proj.v2, proj.majorU, proj.majorV, proj.rMajor, proj.rMinor, 14)
+	end
+	proj.outline = computeConvexHull2D(pts)
+	return proj
+end
+
+local function computeHullProjection(hull, lightDir, plane)
+	if plane.part == hull.sourcePart then
+		return nil
+	end
+	local n = plane.normal
+	local nDotL = n:Dot(lightDir)
+	if nDotL >= -0.03 then
+		return nil
+	end
+
+	local tCenter = (plane.origin - hull.center):Dot(n) / nDotL
+	if tCenter < -(hull.extent + 0.5) or tCenter > CONFIG.MaxShadowDistance then
+		return nil
+	end
+
+	if hull.shapeType == "Sphere" or hull.shapeType == "Cylinder" then
+		local t1 = (plane.origin - hull.endPoint1):Dot(n) / nDotL
+		local t2 = (plane.origin - hull.endPoint2):Dot(n) / nDotL
+		if math.max(t1, t2) < -hull.radius or math.min(t1, t2) > CONFIG.MaxShadowDistance then
+			return nil
+		end
+		local uv1 = worldToPlane2D(plane, hull.endPoint1 + lightDir * math.max(t1, 0))
+		local uv2 = worldToPlane2D(plane, hull.endPoint2 + lightDir * math.max(t2, 0))
+		local proj = { plane = plane, round = true, u1 = uv1.X, v1 = uv1.Y, u2 = uv2.X, v2 = uv2.Y }
+
+		if hull.shapeType == "Sphere" then
+			local lu = lightDir:Dot(plane.tangentU)
+			local lv = lightDir:Dot(plane.tangentV)
+			local lLen = math.sqrt(lu * lu + lv * lv)
+			proj.majorU = (lLen > 1e-4) and (lu / lLen) or 1
+			proj.majorV = (lLen > 1e-4) and (lv / lLen) or 0
+			proj.rMinor = hull.radius
+			proj.rMajor = hull.radius / math.clamp(-nDotL, 0.3, 1.0)
+		else
+			-- Exact ellipse of the projected end disc (two conjugate semi-axes).
+			local cylAxis = hull.cylAxis
+			local upRef = (math.abs(cylAxis.Y) < 0.99) and VEC3_Y or VEC3_X
+			local b1 = cylAxis:Cross(upRef).Unit
+			local b2 = cylAxis:Cross(b1).Unit
+			local p1 = b1 - lightDir * (b1:Dot(n) / nDotL)
+			local p2 = b2 - lightDir * (b2:Dot(n) / nDotL)
+			local R = hull.radius
+			local e1x = math.clamp(p1:Dot(plane.tangentU) * R, -R * 3.5, R * 3.5)
+			local e1y = math.clamp(p1:Dot(plane.tangentV) * R, -R * 3.5, R * 3.5)
+			local e2x = math.clamp(p2:Dot(plane.tangentU) * R, -R * 3.5, R * 3.5)
+			local e2y = math.clamp(p2:Dot(plane.tangentV) * R, -R * 3.5, R * 3.5)
+			local e1Sq = e1x * e1x + e1y * e1y
+			local e2Sq = e2x * e2x + e2y * e2y
+			local avg = 0.5 * (e1Sq + e2Sq)
+			local diff = 0.5 * (e1Sq - e2Sq)
+			local crossDot = e1x * e2x + e1y * e2y
+			local root = math.sqrt(diff * diff + crossDot * crossDot)
+			proj.rMajor = math.sqrt(math.max(0.01, avg + root))
+			proj.rMinor = math.sqrt(math.max(0.01, avg - root))
+			local theta = 0.5 * math.atan2(crossDot, diff)
+			local ct, st = math.cos(theta), math.sin(theta)
+			local majX = e1x * ct + e2x * st
+			local majY = e1y * ct + e2y * st
+			local majLen = math.sqrt(majX * majX + majY * majY)
+			proj.majorU = (majLen > 1e-4) and (majX / majLen) or 1
+			proj.majorV = (majLen > 1e-4) and (majY / majLen) or 0
+		end
+
+		-- Shaft half-width perpendicular to the segment.
+		local du, dv = proj.u2 - proj.u1, proj.v2 - proj.v1
+		local dLen = math.sqrt(du * du + dv * dv)
+		proj.rShaft = proj.rMinor
+		if dLen > 1e-3 then
+			local perpU, perpV = -dv / dLen, du / dLen
+			local pm = proj.majorU * perpU + proj.majorV * perpV
+			local pn = -proj.majorV * perpU + proj.majorU * perpV
+			proj.rShaft = math.sqrt((proj.rMajor * pm) ^ 2 + (proj.rMinor * pn) ^ 2)
+		end
+		return finishRoundProjection(proj)
+	end
+
+	local pts = {}
+	local verts = hull.verts
+	for i = 1, #verts do
+		local v = verts[i]
+		local t = (plane.origin - v):Dot(n) / nDotL
+		if t >= -0.35 and t <= CONFIG.MaxShadowDistance then
+			table.insert(pts, worldToPlane2D(plane, v + lightDir * math.max(t, 0)))
+		end
+	end
+	if #pts < 3 then
+		return nil
+	end
+	local poly = computeConvexHull2D(pts)
+	if #poly < 3 or math.abs(polygonSignedArea(poly)) < 1e-4 then
+		return nil
+	end
+	return { plane = plane, poly = poly, round = false }
+end
+
+-- ============================================================================
+-- OCCLUSION: a shadow only lands where the light reaches the receiver
+-- ============================================================================
+-- Shadow of an occluding part on `plane` (CCW polygon in plane coordinates).
+local function computeOccluderShadow2D(occluder, plane, lightDir)
+	if terrain and occluder == terrain then
+		return nil
+	end
+	if not occluder:IsA("BasePart") then
+		return nil
+	end
+	local n = plane.normal
+	local nDotL = n:Dot(lightDir)
+	if nDotL >= -0.03 then
+		return nil
+	end
+	local cf, size = getPartVisualBox(occluder)
+	local corners = boxCorners(cf, size)
+	local pts = {}
+	local anyInFront = false
+	for i = 1, 8 do
+		local c = corners[i]
+		local t = (plane.origin - c):Dot(n) / nDotL
+		if t > 0.02 then
+			anyInFront = true
+		end
+		if t <= CONFIG.MaxShadowDistance * 2 then
+			pts[#pts + 1] = worldToPlane2D(plane, c + lightDir * math.max(t, 0))
+		end
+	end
+	if not anyInFront or #pts < 3 then
+		return nil
+	end
+	local poly = computeConvexHull2D(pts)
+	if #poly < 3 or math.abs(polygonSignedArea(poly)) < 1e-3 then
+		return nil
+	end
+	return poly
+end
+
+-- Receiver area that is NOT already shadowed by the given occluders.
+-- Returns a list of disjoint convex pieces and whether it is the untouched receiver.
+local function computeVisiblePieces(plane, occluders, lightDir)
+	local receiverPoly = getReceiverPolygon2D(plane)
+	local pieces = { receiverPoly }
+	local untouched = true
+	if not occluders then
+		return pieces, untouched
+	end
+	local rMinX, rMaxX, rMinY, rMaxY = polygonBounds2D(receiverPoly)
+	local used = 0
+	for _, occ in ipairs(occluders) do
+		if used >= CONFIG.MaxOccludersPerPlane or #pieces == 0 or #pieces > 14 then
+			break
+		end
+		if occ ~= plane.part and occ.Parent then
+			local shadow = computeOccluderShadow2D(occ, plane, lightDir)
+			if shadow then
+				local sMinX, sMaxX, sMinY, sMaxY = polygonBounds2D(shadow)
+				if sMaxX > rMinX and sMinX < rMaxX and sMaxY > rMinY and sMinY < rMaxY then
+					used = used + 1
+					local newPieces = {}
+					for _, pc in ipairs(pieces) do
+						local diff = subtractConvex2D(pc, shadow, 0.01)
+						for _, d in ipairs(diff) do
+							table.insert(newPieces, d)
+						end
+					end
+					pieces = newPieces
+					untouched = false
+				end
+			end
+		end
+	end
+	return pieces, untouched
+end
+
+-- Clips one projection against the visible pieces and appends draw ops.
+local function appendProjectionOps(ops, proj, pieces)
+	local shape = proj.round and proj.outline or proj.poly
+	if not shape or #shape < 3 then
+		return
+	end
+	local sMinX, sMaxX, sMinY, sMaxY = polygonBounds2D(shape)
+	for _, piece in ipairs(pieces) do
+		local pMinX, pMaxX, pMinY, pMaxY = polygonBounds2D(piece)
+		if sMaxX > pMinX and sMinX < pMaxX and sMaxY > pMinY and sMinY < pMaxY then
+			if proj.round then
+				local inside = true
+				for i = 1, #shape do
+					if not isPointInConvex2D(piece, shape[i], 1e-3) then
+						inside = false
+						break
+					end
+				end
+				if inside then
+					table.insert(ops.rounds, proj)
+					return
+				end
+			end
+			local clipped = clipPolygonByConvex2D(shape, piece)
+			if #clipped >= 3 and math.abs(polygonSignedArea(clipped)) > 1e-3 then
+				table.insert(ops.polys, clipped)
+			end
+		end
+	end
+end
+
+local function drawPolygonOnPlane(plane, poly)
+	local minU, maxU, minV, maxV = polygonBounds2D(poly)
+	minU = math.max(minU, -plane.halfU)
+	maxU = math.min(maxU, plane.halfU)
+	minV = math.max(minV, -plane.halfV)
+	maxV = math.min(maxV, plane.halfV)
+	if maxU <= minU or maxV <= minV then
+		return
+	end
+	local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
+	for _, tile in ipairs(tiles) do
+		drawConvexPolygonOnTile(poly, tile)
+	end
+end
+
+local function drawRoundOnPlane(plane, r)
+	local minU, maxU, minV, maxV = polygonBounds2D(r.outline)
+	minU = math.max(minU, -plane.halfU)
+	maxU = math.min(maxU, plane.halfU)
+	minV = math.max(minV, -plane.halfV)
+	maxV = math.min(maxV, plane.halfV)
+	if maxU <= minU or maxV <= minV then
+		return
+	end
+	local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
+	for _, tile in ipairs(tiles) do
+		drawRoundShadowOnTile(r, tile)
+	end
+end
+
+local function drawOps(plane, ops)
+	for _, poly in ipairs(ops.polys) do
+		drawPolygonOnPlane(plane, poly)
+	end
+	for _, r in ipairs(ops.rounds) do
+		drawRoundOnPlane(plane, r)
+	end
+end
+
+-- ============================================================================
+-- EVENT-DRIVEN SCENE REGISTRY
 -- ============================================================================
 local characterModels = {}
 local transparentPartsSet = {}
 local globalRaycastIgnoreList = { shadowContainer }
 local mapCasterPartsSet = {}
-local sortedNearbyMapParts = {}
-local lastMapSortTime = 0
-local lastFocusSortPos = Vector3.new(0, -10000, 0)
+local partWatchConnections = setmetatable({}, { __mode = "k" })
 local ignoreListDirty = true
+local characterProfileDirty = setmetatable({}, { __mode = "k" })
 
 local function isActualCharacterModel(model)
 	if not model or not model:IsA("Model") then
@@ -1750,8 +1779,7 @@ local function isActualCharacterModel(model)
 	if model:FindFirstChild("Head") == nil
 		and model:FindFirstChild("Torso") == nil
 		and model:FindFirstChild("UpperTorso") == nil
-		and model:FindFirstChild("HumanoidRootPart") == nil
-	then
+		and model:FindFirstChild("HumanoidRootPart") == nil then
 		return false
 	end
 	return #model:GetChildren() <= 80
@@ -1761,12 +1789,12 @@ local function rebuildGlobalIgnoreList()
 	ignoreListDirty = false
 	clearTable(globalRaycastIgnoreList)
 	table.insert(globalRaycastIgnoreList, shadowContainer)
-	for model, _ in pairs(characterModels) do
+	for model in pairs(characterModels) do
 		if model.Parent then
 			table.insert(globalRaycastIgnoreList, model)
 		end
 	end
-	for part, _ in pairs(transparentPartsSet) do
+	for part in pairs(transparentPartsSet) do
 		if part.Parent then
 			table.insert(globalRaycastIgnoreList, part)
 		end
@@ -1774,7 +1802,7 @@ local function rebuildGlobalIgnoreList()
 end
 
 local function evaluateMapPartState(part)
-	if part == Workspace.Terrain or part:IsDescendantOf(shadowContainer) then
+	if (terrain and part == terrain) or part:IsDescendantOf(shadowContainer) then
 		return
 	end
 	if not isPartOpaqueEnough(part) then
@@ -1784,11 +1812,9 @@ local function evaluateMapPartState(part)
 		end
 		mapCasterPartsSet[part] = nil
 		return
-	else
-		if transparentPartsSet[part] then
-			transparentPartsSet[part] = nil
-			ignoreListDirty = true
-		end
+	elseif transparentPartsSet[part] then
+		transparentPartsSet[part] = nil
+		ignoreListDirty = true
 	end
 
 	local s = part.Size
@@ -1804,14 +1830,21 @@ local function evaluateMapPartState(part)
 	mapCasterPartsSet[part] = true
 end
 
+local function markCharacter(model)
+	if not characterModels[model] then
+		characterModels[model] = true
+		ignoreListDirty = true
+	end
+	characterProfileDirty[model] = true
+end
+
 local function registerInstance(inst)
 	if inst:IsDescendantOf(shadowContainer) then
 		return
 	end
 	if inst:IsA("Humanoid") and inst.Parent and isActualCharacterModel(inst.Parent) then
 		local charModel = inst.Parent
-		characterModels[charModel] = true
-		characterProfileCache[charModel] = nil
+		markCharacter(charModel)
 		for _, desc in ipairs(charModel:GetDescendants()) do
 			if desc:IsA("BasePart") then
 				mapCasterPartsSet[desc] = nil
@@ -1820,10 +1853,10 @@ local function registerInstance(inst)
 				end
 			end
 		end
-		ignoreListDirty = true
-	elseif inst:IsA("CharacterMesh") and inst.Parent and inst.Parent:IsA("Model") then
-		characterProfileCache[inst.Parent] = nil
 	elseif inst:IsA("BasePart") then
+		if terrain and inst == terrain then
+			return
+		end
 		if CONFIG.ForceDisableNativeShadows and inst.CastShadow then
 			inst.CastShadow = false
 		end
@@ -1832,17 +1865,17 @@ local function registerInstance(inst)
 		while anc and anc ~= Workspace and hops < 3 do
 			hops = hops + 1
 			if anc:IsA("Model") and (characterModels[anc] or isActualCharacterModel(anc)) then
-				characterModels[anc] = true
-				characterProfileCache[anc] = nil
-				ignoreListDirty = true
+				markCharacter(anc)
 				return
 			end
 			anc = anc.Parent
 		end
 		evaluateMapPartState(inst)
-		inst:GetPropertyChangedSignal("Transparency"):Connect(function()
-			evaluateMapPartState(inst)
-		end)
+		if not partWatchConnections[inst] then
+			partWatchConnections[inst] = inst:GetPropertyChangedSignal("Transparency"):Connect(function()
+				evaluateMapPartState(inst)
+			end)
+		end
 	end
 end
 
@@ -1850,17 +1883,30 @@ local function unregisterInstance(inst)
 	if inst:IsA("Model") then
 		if characterModels[inst] then
 			characterModels[inst] = nil
-			characterProfileCache[inst] = nil
 			ignoreListDirty = true
 		end
-	elseif inst:IsA("CharacterMesh") and inst.Parent and inst.Parent:IsA("Model") then
-		characterProfileCache[inst.Parent] = nil
 	elseif inst:IsA("BasePart") then
 		mapCasterPartsSet[inst] = nil
 		if transparentPartsSet[inst] then
 			transparentPartsSet[inst] = nil
 			ignoreListDirty = true
 		end
+		local conn = partWatchConnections[inst]
+		if conn then
+			conn:Disconnect()
+			partWatchConnections[inst] = nil
+		end
+	end
+	-- Any change inside a character rebuilds its silhouette clone.
+	local anc = inst.Parent
+	local hops = 0
+	while anc and anc ~= Workspace and hops < 4 do
+		if characterModels[anc] then
+			characterProfileDirty[anc] = true
+			break
+		end
+		anc = anc.Parent
+		hops = hops + 1
 	end
 end
 
@@ -1868,312 +1914,1020 @@ for _, inst in ipairs(Workspace:GetDescendants()) do
 	pcall(registerInstance, inst)
 end
 
-Workspace.DescendantAdded:Connect(function(inst)
+track(Workspace.DescendantAdded:Connect(function(inst)
 	pcall(registerInstance, inst)
-end)
-Workspace.DescendantRemoving:Connect(function(inst)
+end))
+track(Workspace.DescendantRemoving:Connect(function(inst)
 	pcall(unregisterInstance, inst)
-end)
+end))
 
-local staticMapCache = setmetatable({}, { __mode = "k" })
-
--- ============================================================================
--- STENCIL VOLUME PROJECTION (FIXED VERTICAL WALL CLIPPING & CHARACTER CAPSULES)
--- ============================================================================
-local function computeHullProjectionOnPlane(hull, lightDir, plane, rayParams)
-	if plane.part == hull.sourcePart then
-		return nil, nil
-	end
-
-	local nDotL = plane.normal:Dot(lightDir)
-	if nDotL >= -0.025 then
-		return nil, nil
-	end
-
-	local casterToPlaneDist = (plane.origin - hull.center):Dot(plane.normal) / nDotL
-	if casterToPlaneDist < -1.5 or casterToPlaneDist > CONFIG.MaxShadowDistance then
-		return nil, nil
-	end
-
-	if hull.shapeType == "Sphere" then
-		local t1 = (plane.origin - hull.endPoint1):Dot(plane.normal) / nDotL
-		local t2 = (plane.origin - hull.endPoint2):Dot(plane.normal) / nDotL
-		if math.max(t1, t2) < -hull.radius or math.min(t1, t2) > CONFIG.MaxShadowDistance then
-			return nil, nil
-		end
-
-		local hit1 = hull.endPoint1 + lightDir * math.max(t1, 0)
-		local hit2 = hull.endPoint2 + lightDir * math.max(t2, 0)
-
-		local midHit = (hit1 + hit2) * 0.5 + plane.normal * 0.04
-		local toReceiver = midHit - hull.center
-		local distToReceiver = toReceiver.Magnitude
-		if distToReceiver > 0.25 then
-			local checkHit = Workspace:Raycast(hull.center, toReceiver, rayParams)
-			if checkHit and checkHit.Instance ~= plane.part and checkHit.Instance ~= hull.sourcePart then
-				-- Only block if the obstruction is a tall vertical wall (not a chair/seat/step below!)
-				if math.abs(checkHit.Normal:Dot(plane.normal)) < 0.35 and checkHit.Instance.Size.Y > 3.5 then
-					local hitDist = (checkHit.Position - hull.center).Magnitude
-					if hitDist < distToReceiver - CONFIG.WallObstructionTolerance then
-						return nil, nil
-					end
-				end
-			end
-		end
-
-		local rel1 = hit1 - plane.origin
-		local u1 = rel1:Dot(plane.tangentU)
-		local v1 = rel1:Dot(plane.tangentV)
-
-		local rel2 = hit2 - plane.origin
-		local u2 = rel2:Dot(plane.tangentU)
-		local v2 = rel2:Dot(plane.tangentV)
-
-		local lu = lightDir:Dot(plane.tangentU)
-		local lv = lightDir:Dot(plane.tangentV)
-		local lLen = math.sqrt(lu * lu + lv * lv)
-		local majorU = (lLen > 1e-4) and (lu / lLen) or 1
-		local majorV = (lLen > 1e-4) and (lv / lLen) or 0
-
-		local rMinor = hull.radius
-		local rMajor
-		local rShaft
-		if hull.isCharacterCapsule then
-			-- Character bone segments (`p1 -> p2`) ALREADY stretch along `lightDir`!
-			-- Keep cross-section thickness proportional so limbs/shoulders never balloon!
-			rMajor = hull.radius * math.clamp(1.0 / math.clamp(-nDotL, 0.78, 1.0), 1.0, 1.22)
-			rShaft = hull.radius
-		else
-			rMajor = hull.radius / math.clamp(-nDotL, 0.35, 1.0)
-			local du = u2 - u1
-			local dv = v2 - v1
-			local dLen = math.sqrt(du * du + dv * dv)
-			rShaft = rMinor
-			if dLen > 1e-3 then
-				local perpU = -dv / dLen
-				local perpV =  du / dLen
-				local projMaj = majorU * perpU + majorV * perpV
-				local projMin = -majorV * perpU + majorU * perpV
-				rShaft = math.sqrt((rMajor * projMaj) ^ 2 + (rMinor * projMin) ^ 2)
-			end
-		end
-
-		return nil, {
-			plane = plane,
-			u1 = u1,
-			v1 = v1,
-			u2 = u2,
-			v2 = v2,
-			rMinor = rMinor,
-			rMajor = rMajor,
-			rShaft = rShaft,
-			majorU = majorU,
-			majorV = majorV,
-		}
-	end
-
-	if hull.shapeType == "Cylinder" then
-		local t1 = (plane.origin - hull.endPoint1):Dot(plane.normal) / nDotL
-		local t2 = (plane.origin - hull.endPoint2):Dot(plane.normal) / nDotL
-		if math.max(t1, t2) < -0.5 or math.min(t1, t2) > CONFIG.MaxShadowDistance then
-			return nil, nil
-		end
-
-		local hit1 = hull.endPoint1 + lightDir * math.max(t1, 0)
-		local hit2 = hull.endPoint2 + lightDir * math.max(t2, 0)
-
-		local midHit = (hit1 + hit2) * 0.5 + plane.normal * 0.04
-		local toReceiver = midHit - hull.center
-		local distToReceiver = toReceiver.Magnitude
-		if distToReceiver > 0.25 then
-			local checkHit = Workspace:Raycast(hull.center, toReceiver, rayParams)
-			if checkHit and checkHit.Instance ~= plane.part and checkHit.Instance ~= hull.sourcePart then
-				if math.abs(checkHit.Normal:Dot(plane.normal)) < 0.35 and checkHit.Instance.Size.Y > 3.5 then
-					local hitDist = (checkHit.Position - hull.center).Magnitude
-					if hitDist < distToReceiver - CONFIG.WallObstructionTolerance then
-						return nil, nil
-					end
-				end
-			end
-		end
-
-		local rel1 = hit1 - plane.origin
-		local u1 = rel1:Dot(plane.tangentU)
-		local v1 = rel1:Dot(plane.tangentV)
-
-		local rel2 = hit2 - plane.origin
-		local u2 = rel2:Dot(plane.tangentU)
-		local v2 = rel2:Dot(plane.tangentV)
-
-		local cylAxis = hull.cylAxis
-		local upRef = (math.abs(cylAxis.Y) < 0.99) and VEC3_Y or VEC3_X
-		local b1 = cylAxis:Cross(upRef).Unit
-		local b2 = cylAxis:Cross(b1).Unit
-
-		local p1_3d = b1 - lightDir * (b1:Dot(plane.normal) / nDotL)
-		local p2_3d = b2 - lightDir * (b2:Dot(plane.normal) / nDotL)
-
-		local R = hull.radius
-		local e1x = math.clamp(p1_3d:Dot(plane.tangentU) * R, -R * 3.5, R * 3.5)
-		local e1y = math.clamp(p1_3d:Dot(plane.tangentV) * R, -R * 3.5, R * 3.5)
-		local e2x = math.clamp(p2_3d:Dot(plane.tangentU) * R, -R * 3.5, R * 3.5)
-		local e2y = math.clamp(p2_3d:Dot(plane.tangentV) * R, -R * 3.5, R * 3.5)
-
-		local e1Sq = e1x * e1x + e1y * e1y
-		local e2Sq = e2x * e2x + e2y * e2y
-		local avg = 0.5 * (e1Sq + e2Sq)
-		local diff = 0.5 * (e1Sq - e2Sq)
-		local crossDot = e1x * e2x + e1y * e2y
-		local root = math.sqrt(diff * diff + crossDot * crossDot)
-
-		local rMajor = math.sqrt(math.max(0.01, avg + root))
-		local rMinor = math.sqrt(math.max(0.01, avg - root))
-		local theta = 0.5 * math.atan2(crossDot, diff)
-		local ct, st = math.cos(theta), math.sin(theta)
-		local majX = e1x * ct + e2x * st
-		local majY = e1y * ct + e2y * st
-		local majLen = math.sqrt(majX * majX + majY * majY)
-		local majorU = (majLen > 1e-4) and (majX / majLen) or 1
-		local majorV = (majLen > 1e-4) and (majY / majLen) or 0
-
-		local du = u2 - u1
-		local dv = v2 - v1
-		local dLen = math.sqrt(du * du + dv * dv)
-		local rShaft = rMinor
-		if dLen > 1e-3 then
-			local perpU = -dv / dLen
-			local perpV =  du / dLen
-			local proj1 = e1x * perpU + e1y * perpV
-			local proj2 = e2x * perpU + e2y * perpV
-			rShaft = math.sqrt(proj1 * proj1 + proj2 * proj2)
-		end
-
-		return nil, {
-			plane = plane,
-			u1 = u1,
-			v1 = v1,
-			u2 = u2,
-			v2 = v2,
-			rMinor = rMinor,
-			rMajor = rMajor,
-			rShaft = rShaft,
-			majorU = majorU,
-			majorV = majorV,
-		}
-	end
-
-	local partVerts = hull.verts
-	local projected2D = {}
-	local validCount = 0
-
-	for i = 1, #partVerts do
-		local v = partVerts[i]
-		local distToPlane = (plane.origin - v):Dot(plane.normal)
-		local t = distToPlane / nDotL
-
-		if t >= -0.35 and t <= CONFIG.MaxShadowDistance then
-			local hitPt = v + lightDir * math.max(t, 0)
-			local rel = hitPt - plane.origin
-			local u = rel:Dot(plane.tangentU)
-			local w = rel:Dot(plane.tangentV)
-			validCount = validCount + 1
-			projected2D[validCount] = Vector2.new(u, w)
-		end
-	end
-
-	if validCount < 3 then
-		return nil, nil
-	end
-
-	local hull2D = computeConvexHull2D(projected2D)
-	if #hull2D < 3 then
-		return nil, nil
-	end
-
-	local clipped2D = clipPolygonToRect2D(hull2D, plane.halfU, plane.halfV)
-	if #clipped2D < 3 then
-		return nil, nil
-	end
-
-	local sumU, sumV = 0, 0
-	for i = 1, #clipped2D do
-		sumU = sumU + clipped2D[i].X
-		sumV = sumV + clipped2D[i].Y
-	end
-	local centroid2D = Vector2.new(sumU / #clipped2D, sumV / #clipped2D)
-	local centroid3D = plane.origin + plane.tangentU * centroid2D.X + plane.tangentV * centroid2D.Y + plane.normal * 0.04
-
-	local toReceiver = centroid3D - hull.center
-	local distToReceiver = toReceiver.Magnitude
-	if distToReceiver > 0.25 then
-		local checkHit = Workspace:Raycast(hull.center, toReceiver, rayParams)
-		if checkHit and checkHit.Instance ~= plane.part and checkHit.Instance ~= hull.sourcePart then
-			-- CRITICAL FIX: Only clip against tall vertical walls (`abs(normal:Dot(plane.normal)) < 0.35`)!
-			-- Never discard a shadow just because `checkHit` grazed a horizontal bench seat or table leg below `hull.center`!
-			local wallNormal = checkHit.Normal
-			if math.abs(wallNormal:Dot(plane.normal)) < 0.35 and checkHit.Instance.Size.Y > 3.5 then
-				local hitDist = (checkHit.Position - hull.center).Magnitude
-				if hitDist < distToReceiver - CONFIG.WallObstructionTolerance then
-					local wallPoint = checkHit.Position
-					local relWall = wallPoint - plane.origin
-					local wallPt2D = Vector2.new(relWall:Dot(plane.tangentU), relWall:Dot(plane.tangentV))
-					local wallNorm2D = Vector2.new(wallNormal:Dot(plane.tangentU), wallNormal:Dot(plane.tangentV))
-
-					if wallNorm2D.Magnitude > 1e-3 then
-						wallNorm2D = wallNorm2D.Unit
-						local casterRel = hull.center - plane.origin
-						local caster2D = Vector2.new(casterRel:Dot(plane.tangentU), casterRel:Dot(plane.tangentV))
-						if (caster2D - wallPt2D):Dot(wallNorm2D) < 0 then
-							wallNorm2D = -wallNorm2D
-						end
-						clipped2D = clipPolygonHalfPlane2D(clipped2D, wallPt2D, wallNorm2D)
-						if #clipped2D < 3 then
-							return nil, nil
-						end
-					end
-				end
-			end
-		end
-	end
-
-	return {
-		plane = plane,
-		clipped2D = clipped2D,
-		isCurvedMesh = (hull.shapeType == "CurvedBox"),
-	}, nil
-end
-
--- ============================================================================
--- MAIN PER-FRAME STENCIL SHADOW VOLUME PIPELINE
--- ============================================================================
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 pcall(function()
-	rayParams.RespectCanCollide = true
+	rayParams.RespectCanCollide = false
 end)
 
-local CHARACTER_PROBES = {
-	Vector3.new( 0,  0,  0),
-	Vector3.new( 2.0, 0,  0),
-	Vector3.new(-2.0, 0,  0),
-	Vector3.new( 0,  0,  2.0),
-	Vector3.new( 0,  0, -2.0),
-}
+-- ============================================================================
+-- CHARACTER STATE (visible parts, sun visibility, appearance tracking)
+-- ============================================================================
+local charStates = setmetatable({}, { __mode = "k" })
 
-local PROP_PROBES = {
-	Vector3.new( 0, 0, 0),
-	Vector3.new( 1.5, 0, 1.5),
-	Vector3.new(-1.5, 0, -1.5),
-}
+local function shouldTrackCharacterPart(part)
+	if part.Name == "HumanoidRootPart" then
+		return false
+	end
+	local s = part.Size
+	return s.X < 60 and s.Y < 60 and s.Z < 60
+end
 
-local DOWN_PROBE_VEC = Vector3.new(0, -80, 0)
+local function rebuildCharacterParts(state, model)
+	clearTable(state.parts)
+	for _, desc in ipairs(model:GetDescendants()) do
+		if desc:IsA("BasePart") and shouldTrackCharacterPart(desc) then
+			if CONFIG.ForceDisableNativeShadows and desc.CastShadow then
+				desc.CastShadow = false
+			end
+			local prev = state.partInfo[desc]
+			local info = prev or { part = desc, lit = 1, target = 1 }
+			table.insert(state.parts, info)
+		end
+	end
+	local newInfo = {}
+	for _, info in ipairs(state.parts) do
+		newInfo[info.part] = info
+	end
+	state.partInfo = newInfo
+	state.version = state.version + 1
+	state.lastRebuild = os.clock()
+end
 
-local conn = RunService.RenderStepped:Connect(function()
+local function getCharacterState(model)
+	local state = charStates[model]
+	if not state then
+		state = {
+			model = model,
+			parts = {},
+			partInfo = {},
+			version = 0,
+			lastRebuild = -1e9,
+			projectors = {},
+			lastSeenFrame = 0,
+		}
+		charStates[model] = state
+		characterProfileDirty[model] = true
+	end
+	if characterProfileDirty[model] and (os.clock() - state.lastRebuild) > 0.2 then
+		characterProfileDirty[model] = nil
+		rebuildCharacterParts(state, model)
+	end
+	return state
+end
+
+local function isPartVisibleForShadow(part)
+	return part.Parent ~= nil and part.Transparency < 0.98
+end
+
+-- Sun visibility test for every visible part (smoothed so it never pops).
+local function updateCharacterLighting(state, sunDir, dt, detailed)
+	local alpha = 1 - math.exp(-CONFIG.SelfShadowFadeSpeed * dt)
+	local rayVec = sunDir * CONFIG.MaxShadowDistance
+	local rootTarget = nil
+	if not detailed then
+		local root = state.root
+		local hit = Workspace:Raycast(root.Position, rayVec, rayParams)
+		rootTarget = hit and 0 or 1
+	end
+	for _, info in ipairs(state.parts) do
+		local part = info.part
+		if isPartVisibleForShadow(part) then
+			local target = rootTarget
+			if target == nil then
+				local hit = Workspace:Raycast(part.Position, rayVec, rayParams)
+				target = hit and 0 or 1
+			end
+			info.target = target
+			info.lit = info.lit + (target - info.lit) * alpha
+		end
+	end
+end
+
+-- ============================================================================
+-- SELF-SHADOW HIGHLIGHTS (a character standing in shade is darkened)
+-- ============================================================================
+local highlightPool = {}
+local highlightRequests = {}
+
+local function getHighlight(index)
+	local rec = highlightPool[index]
+	if not rec then
+		local h = Instance.new("Highlight")
+		h.Name = "StencilSelfShadow"
+		h.FillColor = CONFIG.ShadowColor
+		h.FillTransparency = 1
+		h.OutlineTransparency = 1
+		h.DepthMode = Enum.HighlightDepthMode.Occluded
+		h.Enabled = false
+		h.Parent = shadowContainer
+		rec = { inst = h, adornee = nil, fill = 1, enabled = false }
+		highlightPool[index] = rec
+	end
+	return rec
+end
+
+local function queueSelfShadow(state, distance)
+	if not CONFIG.CharacterSelfShadow then
+		return
+	end
+	local minShade, maxShade, sum, count = 1, 0, 0, 0
+	for _, info in ipairs(state.parts) do
+		if isPartVisibleForShadow(info.part) then
+			local shade = 1 - info.lit
+			if shade < minShade then minShade = shade end
+			if shade > maxShade then maxShade = shade end
+			sum = sum + shade
+			count = count + 1
+		end
+	end
+	if count == 0 or maxShade < 0.02 then
+		return
+	end
+	table.insert(highlightRequests, {
+		state = state,
+		distance = distance,
+		uniform = (maxShade - minShade) < 0.15,
+		average = sum / count,
+	})
+end
+
+local function applySelfShadowHighlights()
+	table.sort(highlightRequests, function(a, b)
+		return a.distance < b.distance
+	end)
+	local used = 0
+	local budget = math.min(CONFIG.MaxSelfShadowHighlights, 31)
+	local strength = CONFIG.SelfShadowStrength * currentShadowStrength
+
+	local function assign(adornee, shade)
+		if used >= budget then
+			return
+		end
+		used = used + 1
+		local rec = getHighlight(used)
+		local fill = 1 - math.clamp(shade, 0, 1) * strength
+		if rec.adornee ~= adornee then
+			rec.adornee = adornee
+			rec.inst.Adornee = adornee
+		end
+		if math.abs(rec.fill - fill) > 0.004 then
+			rec.fill = fill
+			rec.inst.FillTransparency = fill
+		end
+		if not rec.enabled then
+			rec.enabled = true
+			rec.inst.Enabled = true
+		end
+	end
+
+	for _, req in ipairs(highlightRequests) do
+		local state = req.state
+		local remaining = budget - used
+		if remaining <= 0 then
+			break
+		end
+		if req.uniform then
+			assign(state.model, req.average)
+		else
+			local needed = 0
+			for _, info in ipairs(state.parts) do
+				if isPartVisibleForShadow(info.part) and (1 - info.lit) > 0.02 then
+					needed = needed + 1
+				end
+			end
+			if needed <= remaining - 1 then
+				for _, info in ipairs(state.parts) do
+					if isPartVisibleForShadow(info.part) and (1 - info.lit) > 0.02 then
+						assign(info.part, 1 - info.lit)
+					end
+				end
+			else
+				assign(state.model, req.average)
+			end
+		end
+	end
+
+	for i = used + 1, #highlightPool do
+		local rec = highlightPool[i]
+		if rec.enabled then
+			rec.enabled = false
+			rec.inst.Enabled = false
+			rec.adornee = nil
+			rec.inst.Adornee = nil
+		end
+	end
+	clearTable(highlightRequests)
+end
+
+-- ============================================================================
+-- EXACT CHARACTER SILHOUETTES (ViewportFrame projected along the light)
+-- ============================================================================
+-- The character is mirrored into a black ViewportFrame whose camera looks down
+-- the light direction (near-orthographic). Projecting that image onto a surface
+-- is exact when the image is stretched by k = 1/cos(incidence) along the
+-- direction the light slopes across the surface. A SurfaceGui whose canvas
+-- aspect differs from its carrier part's face performs exactly that stretch.
+local allProjectors = {}
+
+local function createProjector()
+	local part = Instance.new("Part")
+	part.Name = "StencilSilhouette"
+	part.Anchored = true
+	part.CanCollide = false
+	part.CanQuery = false
+	part.CanTouch = false
+	part.CastShadow = false
+	part.Massless = true
+	part.Transparency = 1
+	part.Size = Vector3.new(1, 1, 0.01)
+	part.CFrame = CFrame.new(0, -5000, 0)
+
+	local sgui = Instance.new("SurfaceGui")
+	sgui.Name = "SilhouetteSurfaceGui"
+	sgui.Face = Enum.NormalId.Front
+	sgui.SizingMode = Enum.SurfaceGuiSizingMode.FixedSize
+	sgui.CanvasSize = Vector2.new(64, 64)
+	sgui.LightInfluence = 0
+	sgui.Brightness = 1
+	sgui.ClipsDescendants = true
+	sgui.ResetOnSpawn = false
+	sgui.ZOffset = 2
+	sgui.Enabled = false
+	sgui.Adornee = part
+	sgui.Parent = part
+
+	local vpf = Instance.new("ViewportFrame")
+	vpf.Name = "Silhouette"
+	vpf.BackgroundTransparency = 1
+	vpf.BorderSizePixel = 0
+	vpf.AnchorPoint = Vector2.new(0, 0)
+	vpf.Ambient = Color3.new(0, 0, 0)
+	vpf.LightColor = Color3.new(0, 0, 0)
+	vpf.ImageColor3 = Color3.new(0, 0, 0)
+	vpf.ImageTransparency = currentGroupTransparency
+	vpf.Parent = sgui
+
+	local world = Instance.new("WorldModel")
+	world.Parent = vpf
+
+	local cam = Instance.new("Camera")
+	cam.FieldOfView = CONFIG.SilhouetteFieldOfView
+	cam.Parent = vpf
+	vpf.CurrentCamera = cam
+
+	part.Parent = shadowContainer
+
+	local proj = {
+		carrier = part,
+		sgui = sgui,
+		vpf = vpf,
+		world = world,
+		camera = cam,
+		clones = {},
+		moveParts = {},
+		moveCFrames = {},
+		cloneVersion = -1,
+		enabled = false,
+		imageTransparency = currentGroupTransparency,
+		lastCF = nil, lastSize = nil, lastCanvas = nil,
+		lastVpPos = nil, lastVpSize = nil, lastCamCF = nil,
+	}
+	table.insert(allProjectors, proj)
+	return proj
+end
+
+local function destroyProjector(proj)
+	for i = #allProjectors, 1, -1 do
+		if allProjectors[i] == proj then
+			table.remove(allProjectors, i)
+		end
+	end
+	pcall(function()
+		proj.carrier:Destroy()
+	end)
+end
+
+local function cloneVisualPart(src)
+	pcall(function()
+		src.Archivable = true
+	end)
+	local ok, clone = pcall(function()
+		return src:Clone()
+	end)
+	if not ok or not clone then
+		return nil
+	end
+	for _, d in ipairs(clone:GetDescendants()) do
+		if not (d:IsA("DataModelMesh") or d:IsA("SurfaceAppearance") or d:IsA("Decal")) then
+			pcall(function()
+				d:Destroy()
+			end)
+		end
+	end
+	pcall(function()
+		clone.Anchored = true
+		clone.CanCollide = false
+		clone.CanTouch = false
+		clone.CanQuery = false
+		clone.CastShadow = false
+	end)
+	return clone
+end
+
+local function buildProjectorClones(proj, state)
+	pcall(function()
+		proj.world:ClearAllChildren()
+	end)
+	clearTable(proj.clones)
+	clearTable(proj.moveParts)
+	clearTable(proj.moveCFrames)
+
+	local holder = Instance.new("Model")
+	holder.Name = "SilhouetteClone"
+	for _, info in ipairs(state.parts) do
+		local clone = cloneVisualPart(info.part)
+		if clone then
+			clone.Parent = holder
+			table.insert(proj.clones, { src = info.part, clone = clone, info = info, transparency = clone.Transparency })
+		end
+	end
+
+	-- Classic R6 packages are CharacterMeshes, which need a Humanoid to apply.
+	local hasCharacterMesh = false
+	for _, child in ipairs(state.model:GetChildren()) do
+		if child:IsA("CharacterMesh") then
+			local ok, cm = pcall(function()
+				child.Archivable = true
+				return child:Clone()
+			end)
+			if ok and cm then
+				cm.Parent = holder
+				hasCharacterMesh = true
+			end
+		end
+	end
+	if hasCharacterMesh then
+		pcall(function()
+			local hum = Instance.new("Humanoid")
+			hum.DisplayDistanceType = Enum.HumanoidDisplayDistanceType.None
+			hum.Parent = holder
+		end)
+	end
+
+	holder.Parent = proj.world
+	proj.cloneVersion = state.version
+end
+
+-- Copies the live pose and per-part sun visibility onto the clone.
+local function updateProjectorPose(proj)
+	local parts, cframes = proj.moveParts, proj.moveCFrames
+	local count = 0
+	for _, c in ipairs(proj.clones) do
+		local src = c.src
+		if src.Parent then
+			local srcTr = math.clamp(src.Transparency, 0, 1)
+			local tr = 1 - (1 - srcTr) * math.clamp(c.info.lit, 0, 1)
+			if srcTr >= 0.98 or tr > 0.97 then
+				tr = 1
+			end
+			if math.abs(c.transparency - tr) > 0.02 then
+				c.transparency = tr
+				c.clone.Transparency = tr
+			end
+			count = count + 1
+			parts[count] = c.clone
+			cframes[count] = src.CFrame
+		elseif c.transparency ~= 1 then
+			c.transparency = 1
+			c.clone.Transparency = 1
+		end
+	end
+	for i = count + 1, #parts do
+		parts[i] = nil
+		cframes[i] = nil
+	end
+	local ok = pcall(function()
+		proj.world:BulkMoveTo(parts, cframes, Enum.BulkMoveMode.FireCFrameChanged)
+	end)
+	if not ok then
+		for i = 1, count do
+			parts[i].CFrame = cframes[i]
+		end
+	end
+end
+
+local function setProjectorEnabled(proj, enabled)
+	if proj.enabled ~= enabled then
+		proj.enabled = enabled
+		proj.sgui.Enabled = enabled
+		if not enabled then
+			proj.lastCF = CFrame.new(0, -5000, 0)
+			proj.carrier.CFrame = proj.lastCF
+		end
+	end
+end
+
+-- Orthonormal light frame for a receiver plane.
+--   R  = image right  (lies in the plane)
+--   U  = image up     (perpendicular to the light)
+--   Yp = in-plane direction U lands on; k = stretch along Yp (= 1/cos)
+local function computeLightFrame(plane, lightDir)
+	local n = plane.normal
+	local nDotL = n:Dot(lightDir)
+	if -nDotL < 0.12 then
+		return nil
+	end
+	local perp = n - lightDir * nDotL
+	local U
+	if perp.Magnitude > 1e-3 then
+		U = perp.Unit
+	else
+		local t = plane.tangentV - lightDir * plane.tangentV:Dot(lightDir)
+		U = t.Unit
+	end
+	local R = lightDir:Cross(U).Unit
+	local Uprime = U - lightDir * (U:Dot(n) / nDotL)
+	local k = Uprime.Magnitude
+	return { U = U, R = R, Yp = Uprime / k, k = k, nDotL = nDotL }
+end
+
+local function getVisualRadius(part)
+	local size = part.Size
+	local sp = part:FindFirstChildOfClass("SpecialMesh")
+	if sp then
+		local scaled = size * sp.Scale
+		size = Vector3.new(math.max(size.X, scaled.X), math.max(size.Y, scaled.Y), math.max(size.Z, scaled.Z)) * 1.15
+		return size.Magnitude * 0.5 + sp.Offset.Magnitude
+	end
+	return size.Magnitude * 0.5
+end
+
+-- Light-view bounds of the visible, sunlit parts around `ref`.
+local function computeSilhouetteBounds(state, lf, ref)
+	local s0, s1, r0, r1 = math.huge, -math.huge, math.huge, -math.huge
+	local any = false
+	for _, info in ipairs(state.parts) do
+		local part = info.part
+		if info.lit > 0.03 and isPartVisibleForShadow(part) then
+			local rel = part.Position - ref
+			local s = rel:Dot(lf.R)
+			local r = rel:Dot(lf.U)
+			local rad = info.radius or getVisualRadius(part)
+			info.radius = rad
+			if s - rad < s0 then s0 = s - rad end
+			if s + rad > s1 then s1 = s + rad end
+			if r - rad < r0 then r0 = r - rad end
+			if r + rad > r1 then r1 = r + rad end
+			any = true
+		end
+	end
+	if not any then
+		return nil
+	end
+	local m = 0.2
+	return s0 - m, s1 + m, r0 - m, r1 + m
+end
+
+local function placeProjector(proj, plane, lf, lightDir, Pc, Cc, a, b, x0, x1, y0, y1, pps)
+	local k = lf.k
+	local w = math.max(x1 - x0, 0.05)
+	local h = math.max(y1 - y0, 0.05)
+	pps = math.min(pps, CONFIG.MaxCanvasPixels / math.max(w, a), CONFIG.MaxCanvasPixels * k / math.max(h, k * b))
+
+	local center = Pc + lf.R * ((x0 + x1) * 0.5) + lf.Yp * ((y0 + y1) * 0.5)
+		+ plane.normal * (CONFIG.SurfaceOffset + 0.012)
+	local cf = CFrame.fromMatrix(center, -lf.R, lf.Yp, -plane.normal)
+	local size = Vector3.new(w, h, 0.01)
+	local canvas = Vector2.new(w * pps, h * pps / k)
+	local vpPos = UDim2.new(0, (-a * 0.5 - x0) * pps, 0, (y1 - k * b * 0.5) * pps / k)
+	local vpSize = UDim2.new(0, a * pps, 0, b * pps)
+	local dist = (b * 0.5) / math.tan(math.rad(CONFIG.SilhouetteFieldOfView) * 0.5)
+	local camFrame = CFrame.fromMatrix(Cc - lightDir * dist, lf.R, lf.U, -lightDir)
+
+	if proj.lastSize ~= size then
+		proj.lastSize = size
+		proj.carrier.Size = size
+	end
+	if proj.lastCF ~= cf then
+		proj.lastCF = cf
+		proj.carrier.CFrame = cf
+	end
+	if proj.lastCanvas ~= canvas then
+		proj.lastCanvas = canvas
+		proj.sgui.CanvasSize = canvas
+	end
+	if proj.lastVpPos ~= vpPos then
+		proj.lastVpPos = vpPos
+		proj.vpf.Position = vpPos
+	end
+	if proj.lastVpSize ~= vpSize then
+		proj.lastVpSize = vpSize
+		proj.vpf.Size = vpSize
+	end
+	if proj.lastCamCF ~= camFrame then
+		proj.lastCamCF = camFrame
+		proj.camera.CFrame = camFrame
+	end
+	if math.abs(proj.imageTransparency - currentGroupTransparency) > 0.003 then
+		proj.imageTransparency = currentGroupTransparency
+		proj.vpf.ImageTransparency = currentGroupTransparency
+	end
+	setProjectorEnabled(proj, true)
+end
+
+-- Approximate silhouette: projected (slightly shrunk) visual boxes of every
+-- sunlit part, clipped to the given visible pieces. Used for far characters and
+-- for the slivers an exact silhouette rectangle cannot cover.
+local function drawApproximateCharacter(state, plane, lightDir, pieces)
+	local ops = { polys = {}, rounds = {} }
+	for _, info in ipairs(state.parts) do
+		local part = info.part
+		if info.lit > 0.5 and isPartVisibleForShadow(part) then
+			local cf, size = getPartVisualBox(part)
+			local hull = makeBoxHull(part, cf, size * 0.9)
+			local proj = computeHullProjection(hull, lightDir, plane)
+			if proj then
+				appendProjectionOps(ops, proj, pieces)
+			end
+		end
+	end
+	drawOps(plane, ops)
+end
+
+local function toFootprint(plane, Pc, lf, uv)
+	local w = planeToWorld(plane, uv) - Pc
+	return Vector2.new(w:Dot(lf.R), w:Dot(lf.Yp))
+end
+
+local function fromFootprint(plane, Pc, lf, xy)
+	return worldToPlane2D(plane, Pc + lf.R * xy.X + lf.Yp * xy.Y)
+end
+
+-- Finds the surfaces the character's shadow falls on (first hit per body part
+-- along the light) and every surface that blocks the light in between.
+local function discoverCharacterReceivers(state, lightDir, maxRays)
+	local planes, counts, order = {}, {}, {}
+	local occluders, occluderSet = {}, {}
+	local rays = 0
+	local rayVec = lightDir * CONFIG.MaxShadowDistance
+	for _, info in ipairs(state.parts) do
+		if rays >= maxRays then
+			break
+		end
+		local part = info.part
+		if info.lit > 0.5 and isPartVisibleForShadow(part) then
+			rays = rays + 1
+			local origin = part.Position
+			local hit = Workspace:Raycast(origin, rayVec, rayParams)
+			local hops = 0
+			while hit do
+				local inst = hit.Instance
+				if not occluderSet[inst] then
+					occluderSet[inst] = true
+					table.insert(occluders, inst)
+				end
+				local plane = extractReceiverPlane(inst, hit.Normal, hit.Position, CONFIG.MinReceiverFaceSize)
+				if plane then
+					local key = plane.baseKey
+					if not planes[key] then
+						planes[key] = plane
+						counts[key] = 0
+						table.insert(order, key)
+					end
+					counts[key] = counts[key] + 1
+					break
+				end
+				hops = hops + 1
+				if hops > 2 then
+					break
+				end
+				local resume = hit.Position + lightDir * 0.3
+				local remaining = CONFIG.MaxShadowDistance - (resume - origin).Magnitude
+				if remaining <= 1 then
+					break
+				end
+				hit = Workspace:Raycast(resume, lightDir * remaining, rayParams)
+			end
+		end
+	end
+	table.sort(order, function(x, y)
+		return counts[x] > counts[y]
+	end)
+	local result = {}
+	for _, key in ipairs(order) do
+		table.insert(result, planes[key])
+	end
+	return result, occluders
+end
+
+local function renderCharacterOnPlane(state, plane, occluders, lightDir, proj, pps)
+	local pieces = computeVisiblePieces(plane, occluders, lightDir)
+	if #pieces == 0 then
+		return false
+	end
+	if not proj then
+		drawApproximateCharacter(state, plane, lightDir, pieces)
+		return false
+	end
+
+	local lf = computeLightFrame(plane, lightDir)
+	if not lf then
+		return false
+	end
+	local ref = state.root.Position
+	local s0, s1, r0, r1 = computeSilhouetteBounds(state, lf, ref)
+	if not s0 then
+		return false
+	end
+	local a, b = s1 - s0, r1 - r0
+	local Cc = ref + lf.R * ((s0 + s1) * 0.5) + lf.U * ((r0 + r1) * 0.5)
+	local t = (plane.origin - Cc):Dot(plane.normal) / lf.nDotL
+	if t < -2 or t > CONFIG.MaxShadowDistance then
+		return false
+	end
+	local Pc = Cc + lightDir * t
+	local halfA, halfKB = a * 0.5, lf.k * b * 0.5
+	local footArea = a * lf.k * b
+
+	-- Visible pieces in footprint coordinates, clipped to the footprint.
+	local fpPieces = {}
+	local coveredArea = 0
+	for _, piece in ipairs(pieces) do
+		local conv = {}
+		for i = 1, #piece do
+			conv[i] = toFootprint(plane, Pc, lf, piece[i])
+		end
+		local clipped = clipPolygonToBox2D(conv, -halfA, halfA, -halfKB, halfKB)
+		if #clipped >= 3 then
+			local area = math.abs(polygonSignedArea(clipped))
+			if area > 1e-3 then
+				table.insert(fpPieces, { poly = clipped, area = area })
+				coveredArea = coveredArea + area
+			end
+		end
+	end
+	if #fpPieces == 0 then
+		return false
+	end
+
+	local x0, x1, y0, y1 = -halfA, halfA, -halfKB, halfKB
+	local chosen = nil
+	if not (#fpPieces == 1 and coveredArea >= footArea * 0.998) then
+		table.sort(fpPieces, function(p, q)
+			return p.area > q.area
+		end)
+		local bestArea = 0
+		for i = 1, math.min(3, #fpPieces) do
+			local bx0, bx1, by0, by1, area = largestInscribedAxisRect2D(fpPieces[i].poly)
+			if bx0 and area > bestArea then
+				bestArea = area
+				chosen = i
+				x0, x1, y0, y1 = bx0, bx1, by0, by1
+			end
+		end
+		if not chosen or bestArea < 0.02 then
+			setProjectorEnabled(proj, false)
+			drawApproximateCharacter(state, plane, lightDir, pieces)
+			return false
+		end
+	end
+
+	if proj.cloneVersion ~= state.version then
+		buildProjectorClones(proj, state)
+	end
+	updateProjectorPose(proj)
+	placeProjector(proj, plane, lf, lightDir, Pc, Cc, a, b, x0, x1, y0, y1, pps)
+
+	-- Slivers outside the exact rectangle get the approximate silhouette.
+	if chosen then
+		local rest = {}
+		local rectPoly = rectPolygon2D(x0, x1, y0, y1)
+		for i, fp in ipairs(fpPieces) do
+			local parts = (i == chosen) and subtractConvex2D(fp.poly, rectPoly, 0.01) or { fp.poly }
+			for _, poly in ipairs(parts) do
+				local uvPoly = {}
+				for j = 1, #poly do
+					uvPoly[j] = fromFootprint(plane, Pc, lf, poly[j])
+				end
+				table.insert(rest, ensureCCW(uvPoly))
+			end
+		end
+		if #rest > 0 then
+			drawApproximateCharacter(state, plane, lightDir, rest)
+		end
+	end
+	return true
+end
+
+local function renderCharacterShadow(state, lightDir, distance, allowSilhouette)
+	local maxRays = (distance < CONFIG.SilhouetteDistance) and 40 or 8
+	local planes, occluders = discoverCharacterReceivers(state, lightDir, maxRays)
+	local usedProjectors = 0
+	for idx, plane in ipairs(planes) do
+		local proj = nil
+		if allowSilhouette and idx <= CONFIG.MaxSilhouettePlanes then
+			proj = state.projectors[idx]
+			if not proj then
+				proj = createProjector()
+				state.projectors[idx] = proj
+			end
+		end
+		local pps = CONFIG.SilhouettePixelsPerStud * CONFIG.LodNearDistance
+			/ math.max((plane.origin - camPos).Magnitude, CONFIG.LodNearDistance)
+		pps = math.max(pps, 8)
+		local ok, used = pcall(renderCharacterOnPlane, state, plane, occluders, lightDir, proj, pps)
+		if ok and used then
+			usedProjectors = math.max(usedProjectors, idx)
+		elseif proj then
+			setProjectorEnabled(proj, false)
+		end
+	end
+	for idx, proj in pairs(state.projectors) do
+		if idx > usedProjectors and (idx > #planes or not allowSilhouette) then
+			setProjectorEnabled(proj, false)
+		end
+	end
+	return planes
+end
+
+-- ============================================================================
+-- MAP CASTERS (cached bake: receivers, occluders, clipped draw ops)
+-- ============================================================================
+local staticMapCache = setmetatable({}, { __mode = "k" })
+local sortedNearbyMapParts = {}
+local lastMapSortTime = -1e9
+local lastFocusSortPos = Vector3.new(0, -1e6, 0)
+local DOWN_PROBE_VEC = Vector3.new(0, -120, 0)
+
+local function getCasterProbePoints(hull)
+	local pts = { hull.center }
+	if hull.shapeType == "Box" and hull.verts and #hull.verts == 8 then
+		for _, idx in ipairs({ 3, 4, 7, 8 }) do
+			local v = hull.verts[idx]
+			table.insert(pts, v + (hull.center - v) * 0.08)
+		end
+	elseif hull.endPoint1 and hull.endPoint2 and hull.endPoint1 ~= hull.endPoint2 then
+		table.insert(pts, hull.endPoint1)
+		table.insert(pts, hull.endPoint2)
+	end
+	return pts
+end
+
+-- Walks a ray, skipping the caster itself and slivers too small to receive.
+local function castThrough(origin, direction, caster, occluders, occluderSet)
+	local hit = Workspace:Raycast(origin, direction, rayParams)
+	local hops = 0
+	local dirUnit = direction.Unit
+	while hit and hops < 4 do
+		local inst = hit.Instance
+		if inst ~= caster then
+			if not occluderSet[inst] then
+				occluderSet[inst] = true
+				table.insert(occluders, inst)
+			end
+			local small = inst:IsA("BasePart") and inst ~= terrain
+				and math.max(inst.Size.X, inst.Size.Y, inst.Size.Z) < CONFIG.MinMapReceiverFaceSize
+			if not small then
+				return hit
+			end
+		end
+		hops = hops + 1
+		local resume = hit.Position + dirUnit * 0.3
+		local remaining = direction.Magnitude - (resume - origin).Magnitude
+		if remaining <= 0.5 then
+			return nil
+		end
+		hit = Workspace:Raycast(resume, dirUnit * remaining, rayParams)
+	end
+	return nil
+end
+
+local function bakeMapCaster(part, lightDir, sharedFloorPlanes, doReverseRays)
+	local hull = extractMapPartHull(part)
+	local planes, seen = {}, {}
+	local occluders, occluderSet = {}, {}
+
+	local function addPlane(plane)
+		if plane and not seen[plane.baseKey] and plane.part ~= part then
+			seen[plane.baseKey] = true
+			table.insert(planes, plane)
+		end
+	end
+
+	for _, fp in ipairs(sharedFloorPlanes) do
+		addPlane(fp)
+	end
+
+	local downHit = castThrough(hull.center, DOWN_PROBE_VEC, part, {}, {})
+	if downHit then
+		addPlane(extractReceiverPlane(downHit.Instance, downHit.Normal, downHit.Position, CONFIG.MinMapReceiverFaceSize))
+	end
+
+	local rayVec = lightDir * CONFIG.MaxShadowDistance
+	for _, origin in ipairs(getCasterProbePoints(hull)) do
+		local hit = castThrough(origin, rayVec, part, occluders, occluderSet)
+		if hit then
+			addPlane(extractReceiverPlane(hit.Instance, hit.Normal, hit.Position, CONFIG.MinMapReceiverFaceSize))
+		end
+	end
+
+	local entries = {}
+	local idx = 1
+	while idx <= #planes and idx <= 10 do
+		local plane = planes[idx]
+		idx = idx + 1
+		local proj = computeHullProjection(hull, lightDir, plane)
+		if proj then
+			local planeOccluders = {}
+			local planeSet = {}
+			for _, o in ipairs(occluders) do
+				planeSet[o] = true
+				table.insert(planeOccluders, o)
+			end
+
+			-- Look back towards the sun from the shadow footprint: anything in
+			-- between already shades that area (walls, roofs, floors above).
+			if doReverseRays then
+				local shape = proj.round and proj.outline or proj.poly
+				local cu, cv = 0, 0
+				for i = 1, #shape do
+					cu = cu + shape[i].X
+					cv = cv + shape[i].Y
+				end
+				local centroid = Vector2.new(cu / #shape, cv / #shape)
+				local step = math.max(1, math.floor(#shape / 6))
+				local samples = { centroid }
+				for i = 1, #shape, step do
+					table.insert(samples, shape[i] + (centroid - shape[i]) * 0.06)
+				end
+				for _, uv in ipairs(samples) do
+					if math.abs(uv.X) <= plane.halfU and math.abs(uv.Y) <= plane.halfV then
+						local p = planeToWorld(plane, uv) + plane.normal * 0.05
+						local back = (p - hull.center):Dot(lightDir) - 0.1
+						if back > 0.3 then
+							local hit = castThrough(p, -lightDir * back, part, planeOccluders, planeSet)
+							if hit and #planes < 10 then
+								addPlane(extractReceiverPlane(hit.Instance, hit.Normal, hit.Position, CONFIG.MinMapReceiverFaceSize))
+							end
+						end
+					end
+				end
+			end
+
+			local pieces = computeVisiblePieces(plane, planeOccluders, lightDir)
+			if #pieces > 0 then
+				local ops = { polys = {}, rounds = {} }
+				appendProjectionOps(ops, proj, pieces)
+				if #ops.polys > 0 or #ops.rounds > 0 then
+					table.insert(entries, { plane = plane, ops = ops })
+				end
+			end
+		end
+	end
+	return entries
+end
+
+local function refreshNearbyMapParts(focusPos, nowClock)
+	if not CONFIG.IncludeMapParts then
+		return
+	end
+	if nowClock - lastMapSortTime < CONFIG.MapRefreshInterval and #sortedNearbyMapParts > 0 then
+		return
+	end
+	lastMapSortTime = nowClock
+	if (focusPos - lastFocusSortPos).Magnitude <= 12 and #sortedNearbyMapParts > 0 then
+		return
+	end
+	lastFocusSortPos = focusPos
+	local candidates = {}
+	for part in pairs(mapCasterPartsSet) do
+		if part.Parent and isPartOpaqueEnough(part) then
+			-- Big parts throw big shadows: measure to their surface, not their centre.
+			local dist = (part.Position - focusPos).Magnitude - part.Size.Magnitude * 0.5
+			if dist <= CONFIG.MaxRenderDistance then
+				table.insert(candidates, { part = part, dist = dist })
+			end
+		else
+			mapCasterPartsSet[part] = nil
+			staticMapCache[part] = nil
+		end
+	end
+	table.sort(candidates, function(a, b)
+		return a.dist < b.dist
+	end)
+	clearTable(sortedNearbyMapParts)
+	for i = 1, math.min(#candidates, CONFIG.MaxMapCasters) do
+		sortedNearbyMapParts[i] = candidates[i].part
+	end
+end
+
+local function renderMapCasters(lightDir, sharedFloorPlanes)
+	local bakeStart = os.clock()
+	local baked = 0
+	for i = 1, #sortedNearbyMapParts do
+		local part = sortedNearbyMapParts[i]
+		if part and part.Parent and isPartOpaqueEnough(part) then
+			local cached = staticMapCache[part]
+			local fresh = part.Anchored and cached
+				and cached.lastCFrame == part.CFrame
+				and cached.lastSize == part.Size
+				and (cached.lastLightDir - lightDir).Magnitude < 1e-3
+			if not fresh then
+				if not part.Anchored
+					or baked < CONFIG.MinBakePerFrame
+					or (os.clock() - bakeStart) <= CONFIG.StaticBakeBudgetSeconds then
+					baked = baked + 1
+					local ok, entries = pcall(bakeMapCaster, part, lightDir, sharedFloorPlanes, part.Anchored)
+					cached = {
+						lastCFrame = part.CFrame,
+						lastSize = part.Size,
+						lastLightDir = lightDir,
+						entries = ok and entries or {},
+					}
+					if part.Anchored then
+						staticMapCache[part] = cached
+					end
+				end
+			end
+			if cached then
+				for _, entry in ipairs(cached.entries) do
+					drawOps(entry.plane, entry.ops)
+				end
+			end
+		end
+	end
+end
+
+-- ============================================================================
+-- MAIN PER-FRAME PIPELINE
+-- ============================================================================
+local function computeLightDirection()
+	local sunRaw = Lighting:GetSunDirection()
+	local dir, strength
+	local function fade(y)
+		if not CONFIG.FadeWithSunElevation then
+			return (y > -0.02) and 1 or 0
+		end
+		return smoothstep(-0.01, 0.16, y)
+	end
+	if sunRaw.Y >= 0 then
+		dir = sunRaw
+		strength = fade(sunRaw.Y)
+	else
+		dir = Lighting:GetMoonDirection()
+		strength = CONFIG.NightShadowStrength * fade(dir.Y)
+	end
+
+	local minEl = math.clamp(CONFIG.MinSunElevation, 0.05, 0.99)
+	if dir.Y < minEl then
+		local horiz = Vector3.new(dir.X, 0, dir.Z)
+		if horiz.Magnitude < 1e-4 then
+			horiz = VEC3_X
+		end
+		dir = horiz.Unit * math.sqrt(1 - minEl * minEl) + VEC3_Y * minEl
+	end
+	return -dir.Unit, dir.Unit, strength
+end
+
+local function getCharacterRoot(model)
+	local root = model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart
+		or model:FindFirstChild("Torso") or model:FindFirstChild("UpperTorso") or model:FindFirstChild("Head")
+	if root and root:IsA("BasePart") then
+		return root
+	end
+	return nil
+end
+
+local function releaseCharacterState(model)
+	local state = charStates[model]
+	if state then
+		for _, proj in pairs(state.projectors) do
+			destroyProjector(proj)
+		end
+		clearTable(state.projectors)
+		charStates[model] = nil
+	end
+end
+
+local frameCounter = 0
+
+local conn = RunService.RenderStepped:Connect(function(dt)
 	local camera = Workspace.CurrentCamera
 	if not camera then
 		return
 	end
+	dt = math.clamp(dt or 1 / 60, 0, 0.25)
+	frameCounter = frameCounter + 1
+	updateCameraCache(camera)
 
 	if CONFIG.ForceDisableNativeShadows and Lighting.GlobalShadows then
 		pcall(function()
@@ -2184,317 +2938,139 @@ local conn = RunService.RenderStepped:Connect(function()
 	for _, player in ipairs(Players:GetPlayers()) do
 		local char = player.Character
 		if char and not characterModels[char] then
-			characterModels[char] = true
-			ignoreListDirty = true
+			markCharacter(char)
 		end
 	end
-
 	if ignoreListDirty then
 		rebuildGlobalIgnoreList()
+		rayParams.FilterDescendantsInstances = globalRaycastIgnoreList
 	end
 
-	local sunDir = Lighting:GetSunDirection()
-	if sunDir.Y < -0.05 then
-		sunDir = Lighting:GetMoonDirection()
-	end
-	if sunDir.Y < 0.15 then
-		sunDir = Vector3.new(sunDir.X, 0.32, sunDir.Z).Unit
-	end
-	local lightDir = -sunDir.Unit
+	local lightDir, sunDir, strength = computeLightDirection()
+	currentShadowStrength = strength
+	currentGroupTransparency = 1 - math.clamp(CONFIG.ShadowDarkness * strength, 0, 1)
+	local shadowsOn = strength > 0.01
 
-	local nowClock = os.clock()
 	clearTable(frameTilesByKey)
-	local globalReceiverPlanes = {}
-	local activeFloorPlanesList = {}
+	local sharedFloorPlanes = {}
+	local sharedFloorKeys = {}
 
+	local focusPos = camPos
 	local localPlayer = Players.LocalPlayer
-	local focusPos = camera.CFrame.Position
-	if localPlayer and localPlayer.Character then
-		local root = localPlayer.Character.PrimaryPart or localPlayer.Character:FindFirstChild("HumanoidRootPart")
-		if root and root:IsA("BasePart") then
+	local localChar = localPlayer and localPlayer.Character
+	if localChar then
+		local root = getCharacterRoot(localChar)
+		if root then
 			focusPos = root.Position
 		end
 	end
 
-	rayParams.FilterDescendantsInstances = globalRaycastIgnoreList
-
-	-- 1. PROCESS DYNAMIC CHARACTER MODELS FIRST
-	for model, _ in pairs(characterModels) do
+	-- 1. CHARACTERS (exact silhouettes near the camera, approximations further out)
+	local chars = {}
+	for model in pairs(characterModels) do
 		if model.Parent then
-			local root = model.PrimaryPart or model:FindFirstChild("HumanoidRootPart") or model:FindFirstChildWhichIsA("BasePart")
-			if root and root:IsA("BasePart") then
-				local dist = (root.Position - focusPos).Magnitude
-				if dist <= CONFIG.MaxRenderDistance then
-					local okHulls, hulls = pcall(extractCharacterCasterHulls, model)
-					if okHulls and hulls and #hulls > 0 then
-						local localPlanesForGroup = {}
-						local rootPos = root.Position
-
-						for i = 1, #CHARACTER_PROBES do
-							local probeOrigin = rootPos + CHARACTER_PROBES[i]
-							local hit = Workspace:Raycast(probeOrigin, lightDir * CONFIG.MaxShadowDistance, rayParams)
-							if hit and hit.Instance and hit.Instance:IsA("BasePart") then
-								local plane = extractReceiverPlane(hit.Instance, hit.Normal, hit.Position, CONFIG.MinReceiverFaceSize)
-								if plane then
-									if not globalReceiverPlanes[plane.baseKey] then
-										globalReceiverPlanes[plane.baseKey] = plane
-										if plane.normal.Y > 0.7 then
-											table.insert(activeFloorPlanesList, plane)
-										end
-									end
-									localPlanesForGroup[plane.baseKey] = globalReceiverPlanes[plane.baseKey]
-
-									local hitPart = hit.Instance
-									if math.abs(hit.Normal.Y) > 0.7 then
-										local horizLight = Vector3.new(lightDir.X, 0, lightDir.Z)
-										if horizLight.Magnitude > 0.05 then
-											local stepOrigin = hit.Position + horizLight.Unit * 2.2 + Vector3.new(0, 0.3, 0)
-											local cliffHit = Workspace:Raycast(stepOrigin, lightDir * CONFIG.MaxShadowDistance, rayParams)
-											if cliffHit and cliffHit.Instance and cliffHit.Instance:IsA("BasePart") and cliffHit.Instance ~= hitPart then
-												local cliffPlane = extractReceiverPlane(cliffHit.Instance, cliffHit.Normal, cliffHit.Position, CONFIG.MinReceiverFaceSize)
-												if cliffPlane then
-													if not globalReceiverPlanes[cliffPlane.baseKey] then
-														globalReceiverPlanes[cliffPlane.baseKey] = cliffPlane
-														if cliffPlane.normal.Y > 0.7 then
-															table.insert(activeFloorPlanesList, cliffPlane)
-														end
-													end
-													localPlanesForGroup[cliffPlane.baseKey] = globalReceiverPlanes[cliffPlane.baseKey]
-												end
-											end
-										end
-									end
-								end
-							end
-						end
-
-						for _, plane in pairs(localPlanesForGroup) do
-							for _, hull in ipairs(hulls) do
-								local polyProj, roundProj = computeHullProjectionOnPlane(hull, lightDir, plane, rayParams)
-								if polyProj then
-									local clipped2D = polyProj.clipped2D
-									local minU, maxU = math.huge, -math.huge
-									local minV, maxV = math.huge, -math.huge
-									for vIdx = 1, #clipped2D do
-										local p = clipped2D[vIdx]
-										if p.X < minU then minU = p.X end
-										if p.X > maxU then maxU = p.X end
-										if p.Y < minV then minV = p.Y end
-										if p.Y > maxV then maxV = p.Y end
-									end
-									local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
-									for _, tile in ipairs(tiles) do
-										drawConvexPolygonOnTile(clipped2D, tile, polyProj.isCurvedMesh)
-									end
-								elseif roundProj then
-									local pad = math.max(roundProj.rMajor, roundProj.rMinor, roundProj.rShaft) + 0.5
-									local minU = math.max(-plane.halfU, math.min(roundProj.u1, roundProj.u2) - pad)
-									local maxU = math.min( plane.halfU, math.max(roundProj.u1, roundProj.u2) + pad)
-									local minV = math.max(-plane.halfV, math.min(roundProj.v1, roundProj.v2) - pad)
-									local maxV = math.min( plane.halfV, math.max(roundProj.v1, roundProj.v2) + pad)
-									if maxU >= minU and maxV >= minV then
-										local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
-										for _, tile in ipairs(tiles) do
-											drawRoundShadowOnTile(
-												roundProj.u1, roundProj.v1, roundProj.u2, roundProj.v2,
-												roundProj.rMinor, roundProj.rMajor, roundProj.rShaft,
-												roundProj.majorU, roundProj.majorV,
-												tile
-											)
-										end
-									end
-								end
-							end
-						end
-					end
+			local root = getCharacterRoot(model)
+			if root then
+				local d = (root.Position - camPos).Magnitude
+				if model == localChar then
+					d = 0
+				end
+				if d <= CONFIG.MaxCharacterDistance then
+					table.insert(chars, { model = model, root = root, dist = d })
 				end
 			end
 		else
 			characterModels[model] = nil
-			characterProfileCache[model] = nil
 			ignoreListDirty = true
+			releaseCharacterState(model)
 		end
 	end
+	table.sort(chars, function(a, b)
+		return a.dist < b.dist
+	end)
 
-	-- 2. REFRESH & RENDER NEARBY MAP CASTERS (DEDICATED BAKE TIMER + AUTOMATIC FLOOR SHARING)
-	if CONFIG.IncludeMapParts and (nowClock - lastMapSortTime >= CONFIG.MapRefreshInterval or #sortedNearbyMapParts == 0) then
-		lastMapSortTime = nowClock
-		if (focusPos - lastFocusSortPos).Magnitude > 16 or #sortedNearbyMapParts == 0 then
-			lastFocusSortPos = focusPos
-			local candidates = {}
-			for part, _ in pairs(mapCasterPartsSet) do
-				if part.Parent and isPartOpaqueEnough(part) then
-					local dist = (part.Position - focusPos).Magnitude
-					if dist <= CONFIG.MaxRenderDistance then
-						table.insert(candidates, { part = part, dist = dist })
-					end
-				else
-					mapCasterPartsSet[part] = nil
-					staticMapCache[part] = nil
-				end
+	local silhouettesUsed = 0
+	for _, c in ipairs(chars) do
+		local state = getCharacterState(c.model)
+		state.root = c.root
+		state.lastSeenFrame = frameCounter
+		local detailed = c.dist < CONFIG.SilhouetteDistance
+		pcall(updateCharacterLighting, state, sunDir, dt, detailed)
+		queueSelfShadow(state, c.dist)
+
+		if shadowsOn then
+			local allow = detailed and silhouettesUsed < CONFIG.MaxSilhouetteCharacters
+				and isSphereOnScreen(c.root.Position, 30)
+			if allow then
+				silhouettesUsed = silhouettesUsed + 1
+				state.lastAllowedFrame = frameCounter
 			end
-			table.sort(candidates, function(a, b)
-				return a.dist < b.dist
+			local ok, planes = pcall(function()
+				return renderCharacterShadow(state, lightDir, c.dist, allow)
 			end)
-			clearTable(sortedNearbyMapParts)
-			local count = math.min(#candidates, CONFIG.MaxMapCasters)
-			for i = 1, count do
-				sortedNearbyMapParts[i] = candidates[i].part
+			if ok and planes then
+				for _, plane in ipairs(planes) do
+					if plane.normal.Y > 0.7 and not sharedFloorKeys[plane.baseKey] and #sharedFloorPlanes < 6 then
+						sharedFloorKeys[plane.baseKey] = true
+						table.insert(sharedFloorPlanes, plane)
+					end
+				end
+			end
+		else
+			for _, proj in pairs(state.projectors) do
+				setProjectorEnabled(proj, false)
 			end
 		end
 	end
 
-	local bakeStartClock = os.clock()
-	local bakedThisFrame = 0
-
-	for i = 1, #sortedNearbyMapParts do
-		local part = sortedNearbyMapParts[i]
-		if part and part.Parent and isPartOpaqueEnough(part) then
-			local cached = staticMapCache[part]
-			local needsRecompute = true
-
-			if part.Anchored and cached then
-				if cached.lastCFrame == part.CFrame
-					and cached.lastSize == part.Size
-					and (cached.lastLightDir - lightDir).Magnitude < 1e-3
-				then
-					needsRecompute = false
+	-- Free silhouette clones of characters that left the area.
+	if frameCounter % 60 == 0 then
+		for model, state in pairs(charStates) do
+			if frameCounter - (state.lastSeenFrame or 0) > 240 or not model.Parent then
+				releaseCharacterState(model)
+			elseif frameCounter - (state.lastAllowedFrame or 0) > 600 and next(state.projectors) then
+				-- Far away for ~10s: drop its silhouette clones (rebuilt on demand).
+				for _, proj in pairs(state.projectors) do
+					destroyProjector(proj)
 				end
-			end
-
-			if needsRecompute then
-				if not part.Anchored
-					or bakedThisFrame < CONFIG.MinBakePerFrame
-					or (os.clock() - bakeStartClock <= CONFIG.StaticBakeBudgetSeconds)
-				then
-					bakedThisFrame = bakedThisFrame + 1
-					local hull = extractMapPartHull(part)
-					local discoveredPlanes = {}
-					local seenKeys = {}
-					local rootPos = part.Position
-
-					-- Automatically include the floor planes already found under the player so booths/tables
-					-- in the same room ALWAYS project onto the room floor even if surrounded by other parts!
-					for fIdx = 1, #activeFloorPlanesList do
-						local fp = activeFloorPlanesList[fIdx]
-						if not seenKeys[fp.baseKey] then
-							seenKeys[fp.baseKey] = true
-							table.insert(discoveredPlanes, fp)
-						end
-					end
-
-					-- Probe A: Straight downward floor probe
-					local downHit = Workspace:Raycast(rootPos, DOWN_PROBE_VEC, rayParams)
-					local downHops = 0
-					while downHit and downHops < 4 do
-						local hitInst = downHit.Instance
-						if hitInst == part or (hitInst:IsA("BasePart") and math.max(hitInst.Size.X, hitInst.Size.Z) < CONFIG.MinMapReceiverFaceSize) then
-							downHops = downHops + 1
-							downHit = Workspace:Raycast(downHit.Position + Vector3.new(0, -0.35, 0), DOWN_PROBE_VEC, rayParams)
-						else
-							break
-						end
-					end
-					if downHit and downHit.Instance and downHit.Instance:IsA("BasePart") and downHit.Instance ~= part then
-						local plane = extractReceiverPlane(downHit.Instance, downHit.Normal, downHit.Position, CONFIG.MinMapReceiverFaceSize)
-						if plane and not seenKeys[plane.baseKey] then
-							seenKeys[plane.baseKey] = true
-							table.insert(discoveredPlanes, plane)
-						end
-					end
-
-					-- Probe B: Angled light-direction probes
-					for pIdx = 1, #PROP_PROBES do
-						local probeOrigin = rootPos + PROP_PROBES[pIdx]
-						local hit = Workspace:Raycast(probeOrigin, lightDir * CONFIG.MaxShadowDistance, rayParams)
-						local hops = 0
-						while hit and hops < 3 do
-							local hitInst = hit.Instance
-							if hitInst == part or (hitInst:IsA("BasePart") and math.max(hitInst.Size.X, hitInst.Size.Z) < CONFIG.MinMapReceiverFaceSize) then
-								hops = hops + 1
-								hit = Workspace:Raycast(hit.Position + lightDir * 0.25, lightDir * CONFIG.MaxShadowDistance, rayParams)
-							else
-								break
-							end
-						end
-						if hit and hit.Instance and hit.Instance:IsA("BasePart") and hit.Instance ~= part then
-							local plane = extractReceiverPlane(hit.Instance, hit.Normal, hit.Position, CONFIG.MinMapReceiverFaceSize)
-							if plane and not seenKeys[plane.baseKey] then
-								seenKeys[plane.baseKey] = true
-								table.insert(discoveredPlanes, plane)
-							end
-						end
-					end
-
-					local polys = {}
-					local rounds = {}
-
-					for _, plane in ipairs(discoveredPlanes) do
-						local polyProj, roundProj = computeHullProjectionOnPlane(hull, lightDir, plane, rayParams)
-						if polyProj then
-							table.insert(polys, polyProj)
-						elseif roundProj then
-							table.insert(rounds, roundProj)
-						end
-					end
-
-					cached = {
-						lastCFrame = part.CFrame,
-						lastSize = part.Size,
-						lastLightDir = lightDir,
-						polys = polys,
-						rounds = rounds,
-					}
-					if part.Anchored then
-						staticMapCache[part] = cached
-					end
-				end
-			end
-
-			if cached then
-				for _, polyProj in ipairs(cached.polys) do
-					local plane = polyProj.plane
-					local clipped2D = polyProj.clipped2D
-					local minU, maxU = math.huge, -math.huge
-					local minV, maxV = math.huge, -math.huge
-					for vIdx = 1, #clipped2D do
-						local p = clipped2D[vIdx]
-						if p.X < minU then minU = p.X end
-						if p.X > maxU then maxU = p.X end
-						if p.Y < minV then minV = p.Y end
-						if p.Y > maxV then maxV = p.Y end
-					end
-					local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
-					for _, tile in ipairs(tiles) do
-						drawConvexPolygonOnTile(clipped2D, tile, polyProj.isCurvedMesh)
-					end
-				end
-
-				for _, roundProj in ipairs(cached.rounds) do
-					local plane = roundProj.plane
-					local pad = math.max(roundProj.rMajor, roundProj.rMinor, roundProj.rShaft) + 0.5
-					local minU = math.max(-plane.halfU, math.min(roundProj.u1, roundProj.u2) - pad)
-					local maxU = math.min( plane.halfU, math.max(roundProj.u1, roundProj.u2) + pad)
-					local minV = math.max(-plane.halfV, math.min(roundProj.v1, roundProj.v2) - pad)
-					local maxV = math.min( plane.halfV, math.max(roundProj.v1, roundProj.v2) + pad)
-					if maxU >= minU and maxV >= minV then
-						local tiles = getOverlappingTiles(plane, minU, maxU, minV, maxV)
-						for _, tile in ipairs(tiles) do
-							drawRoundShadowOnTile(
-								roundProj.u1, roundProj.v1, roundProj.u2, roundProj.v2,
-								roundProj.rMinor, roundProj.rMajor, roundProj.rShaft,
-								roundProj.majorU, roundProj.majorV,
-								tile
-							)
-						end
-					end
+				clearTable(state.projectors)
+			elseif frameCounter - (state.lastSeenFrame or 0) > 2 then
+				for _, proj in pairs(state.projectors) do
+					setProjectorEnabled(proj, false)
 				end
 			end
 		end
 	end
 
+	-- 2. MAP CASTERS
+	if shadowsOn and CONFIG.IncludeMapParts then
+		refreshNearbyMapParts(focusPos, os.clock())
+		renderMapCasters(lightDir, sharedFloorPlanes)
+	end
+
+	applySelfShadowHighlights()
 	finalizeCanvasSlotsForFrame()
 end)
+track(conn)
 
 globalEnv._StencilShadowConnection = conn
-
+globalEnv._StencilShadowCleanup = function()
+	for _, c in ipairs(trackedConnections) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	for _, c in pairs(partWatchConnections) do
+		pcall(function()
+			c:Disconnect()
+		end)
+	end
+	pcall(function()
+		shadowContainer:Destroy()
+	end)
+	if originalGlobalShadows ~= nil then
+		pcall(function()
+			Lighting.GlobalShadows = originalGlobalShadows
+		end)
+	end
+end
