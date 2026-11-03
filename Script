@@ -1,11 +1,22 @@
 --[[
 	============================================================================
-	ROBLOX REAL-TIME STENCIL SHADOW ENGINE (v21 - Retained, Long Range, Stencil-Merged)
+	ROBLOX REAL-TIME STENCIL SHADOW ENGINE (v22 - Soft Edges, Seamless, Retained)
 	============================================================================
 	Client-side (LocalScript / StarterPlayerScripts / executor).
 
-	Look for "[StencilShadow v21]" in the output/F9 console when it starts. If
+	Look for "[StencilShadow v22]" in the output/F9 console when it starts. If
 	you do not see that line you are still running an older copy of the file.
+
+	NEW IN v22 (from the second phone recording):
+	 * Shadow edges are soft and anti-aliased (a gradient "skirt" along every real
+	   edge) instead of stair-stepped. Tune with EdgeFeatherPx (0 = hard edges).
+	 * No more white hairlines along tile borders: tile canvases overlap a hair.
+	 * No flicker from tile churn: built tiles are kept as a cache (hidden when off
+	   screen), only the least valuable one is replaced, new tiles fade in, the
+	   quality governor moves slowly, and the surfaces under a character stay steady.
+	 * Changing resolution no longer rebuilds tiles (everything is laid out in canvas
+	   fractions) and the polygon fill is much cheaper (plain number arrays).
+	 * Longer range on phones: 120 tile canvases and 600 shadow casters (was 72/350).
 
 	WHY v20 (v19 was laggy and did not reach far):
 	 * Map shadows are RETAINED. They are baked once into their tiles and left
@@ -198,7 +209,7 @@ local MOBILE_PRESET = {
 	MaxSilhouetteCharacters = 2,
 	FarHullDistance = 14,
 	MaxSilhouettePlanes = 1,
-	SilhouettePixelsPerStud = 24,
+	SilhouettePixelsPerStud = 32,
 	MaxSelfShadowHighlights = 3,
 	LocalReceiverInterval = 4,
 	OtherReceiverInterval = 8,
@@ -1072,7 +1083,10 @@ do
 			slot.fade = 0
 			slot.gt = 1
 			slot.canvasGroup.GroupTransparency = 1
-			fadingSlots[#fadingSlots + 1] = slot
+			if not slot.inFadeList then
+				slot.inFadeList = true
+				fadingSlots[#fadingSlots + 1] = slot
+			end
 		else
 			slot.fade = 1
 			if slot.gt ~= currentGroupTransparency then
@@ -1479,7 +1493,9 @@ do
 			local keepN = 0
 			for i = 1, #fadingSlots do
 				local slot = fadingSlots[i]
-				if slot.rec and slot.fade < 1 then
+				if not (slot.rec and slot.fade < 1) then
+					slot.inFadeList = false
+				else
 					slot.fade = math.min(1, slot.fade + fdt / CONFIG.TileFadeSeconds)
 					local e = slot.fade * slot.fade * (3 - 2 * slot.fade)
 					local g = 1 - (1 - currentGroupTransparency) * e
@@ -1493,6 +1509,8 @@ do
 					if slot.fade < 1 then
 						keepN = keepN + 1
 						fadingSlots[keepN] = slot
+					else
+						slot.inFadeList = false
 					end
 				end
 			end
@@ -1655,7 +1673,18 @@ do
 			end
 			prims = prims + slot.stat.prevRect + slot.stat.prevDisc + slot.stat.prevBand + slot.dyn.prevRect + slot.dyn.prevDisc + slot.dyn.prevBand
 		end
-		return bound, #tileRecList, prims, #dirtyQueue - dirtyHead + 1
+		local shown, shownPx, soft = 0, 0, 0
+		for i = 1, #canvasSlots do
+			local slot = canvasSlots[i]
+			if slot.rec and slot.enabled then
+				shown = shown + 1
+				shownPx = shownPx + (slot.rec.canvasPx or 0)
+				if slot.stat.nBand > 0 or slot.stat.prevBand > 0 then
+					soft = soft + 1
+				end
+			end
+		end
+		return bound, #tileRecList, prims, #dirtyQueue - dirtyHead + 1, shown, shownPx, soft
 	end
 
 end
@@ -4620,7 +4649,7 @@ local function updateGovernor(dt)
 end
 
 local function collectStats()
-	local bound, total, prims, queue = getTileStats()
+	local bound, total, prims, queue, shown, shownPx, soft = getTileStats()
 	local baked, projectors = 0, 0
 	for _ in pairs(casterStates) do
 		baked = baked + 1
@@ -4638,6 +4667,9 @@ local function collectStats()
 		boundTiles = bound,
 		totalTiles = total,
 		shadowPrimitives = prims,
+		shownTiles = shown,
+		shownPixels = shownPx,
+		softTiles = soft,
 		casterCandidates = #casterList,
 		casterNearby = #nearbyList,
 		castersBaked = baked,
@@ -4689,7 +4721,7 @@ function ensureOverlay()
 	label.BorderSizePixel = 0
 	label.AnchorPoint = Vector2.new(1, 0)
 	label.Position = UDim2.new(1, -4, 0, 96)
-	label.Size = UDim2.new(0, 330, 0, 150)
+	label.Size = UDim2.new(0, 400, 0, 150)
 	label.Font = Enum.Font.Code
 	label.TextSize = 11
 	label.TextColor3 = Color3.new(1, 1, 1)
@@ -4731,7 +4763,7 @@ local function updateOverlay(now, localChar)
 		phases[k] = 0
 	end
 	lines[4] = string.format("tiles %d/%d q%d prims %d", s.boundTiles, s.totalTiles, s.tileBuildQueue, s.shadowPrimitives)
-	lines[5] = string.format("casters %d/%d baked %d", s.casterNearby, s.casterCandidates, s.castersBaked)
+	lines[5] = string.format("casters %d/%d baked %d | shown %d (%.1fMpx) soft %d", s.casterNearby, s.casterCandidates, s.castersBaked, s.shownTiles, s.shownPixels / 1e6, s.softTiles)
 	lines[6] = string.format("sun %.0fdeg (used %.0f) s%.2f", el(overlay.sunRaw), el(overlay.sunUsed), overlay.strength)
 	local st = localChar and charStates[localChar]
 	if st then
@@ -4745,7 +4777,7 @@ local function updateOverlay(now, localChar)
 		lines[7] = "YOU: no character yet"
 	end
 	lines[#lines + 1] = "err " .. string.sub(lastErrorText, 1, 46)
-	overlay.label.Size = UDim2.new(0, 330, 0, #lines * 13 + 6)
+	overlay.label.Size = UDim2.new(0, 400, 0, #lines * 13 + 6)
 	overlay.label.Text = table.concat(lines, "\n")
 end
 
