@@ -121,6 +121,7 @@ local CONFIG = {
 	MinBakePerFrame = 2,                    -- Always make at least this much baking progress
 	BakeChecksPerFrame = 120,               -- Casters checked for changes per frame
 	TileBuildBudgetSeconds = 0.0016,        -- Time per frame spent (re)building tile canvases
+	PrimCreateBudget = 140,                 -- GUI frames created per frame while building tiles (a big tile is built over several frames)
 	MinTilesBuiltPerFrame = 1,
 	LightRebakeAngleDeg = 0.7,              -- Re-bake map shadows when the sun moved this much
 
@@ -186,6 +187,7 @@ local MOBILE_PRESET = {
 	BakeChecksPerFrame = 80,
 	BakeBudgetSeconds = 0.0015,
 	TileBuildBudgetSeconds = 0.001,
+	PrimCreateBudget = 45,
 	LightRebakeAngleDeg = 1.2,
 	MaxSilhouetteCharacters = 2,
 	MaxSilhouettePlanes = 1,
@@ -641,19 +643,29 @@ do
 		return { holder = holder, dynamic = (isDynamic == true), rects = {}, discs = {}, nRect = 0, nDisc = 0, prevRect = 0, prevDisc = 0 }
 	end
 
+	-- Creating a GUI Frame property by property is slow (and much slower on a phone):
+	-- clone a pre-configured template instead (one call per primitive).
+	local frameTemplate, discTemplate = nil, nil
+	local primCreatedFrame = 0
+
 	local function createPrimitive(pool, isDisc)
-		local f = Instance.new("Frame")
-		f.AnchorPoint = Vector2.new(0.5, 0.5)
-		f.BackgroundColor3 = CONFIG.ShadowColor
-		f.BackgroundTransparency = 0
-		f.BorderSizePixel = 0
-		f.Visible = false
-		if isDisc then
+		if not frameTemplate then
+			local f = Instance.new("Frame")
+			f.AnchorPoint = Vector2.new(0.5, 0.5)
+			f.BackgroundColor3 = CONFIG.ShadowColor
+			f.BackgroundTransparency = 0
+			f.BorderSizePixel = 0
+			f.Visible = false
+			frameTemplate = f
+			local d = f:Clone()
 			local corner = Instance.new("UICorner")
 			corner.CornerRadius = UDim.new(1, 0)
-			corner.Parent = f
+			corner.Parent = d
+			discTemplate = d
 		end
+		local f = (isDisc and discTemplate or frameTemplate):Clone()
 		f.Parent = pool.holder
+		primCreatedFrame = primCreatedFrame + 1
 		return { frame = f, x = -1e9, y = -1e9, w = -1, h = -1, rot = -1e9, shown = false }
 	end
 
@@ -815,6 +827,7 @@ do
 		if slot then
 			totalCanvasPx = totalCanvasPx - (rec.canvasPx or 0)
 			rec.canvasPx = 0
+			rec.job = nil
 			parkSlot(slot)
 			rec.slot = nil
 			rec.dirty = true
@@ -868,6 +881,9 @@ do
 
 	local function markTileDirty(rec)
 		rec.dirty = true
+		if rec.job then
+			rec.job.stale = true
+		end
 		if rec.wanted then
 			enqueueTile(rec)
 		end
@@ -911,6 +927,7 @@ do
 			dist = math.huge,
 			lastDynFrame = -1000,
 			prio = math.huge,
+			job = nil,
 			onScreen = true,
 			canvasPx = 0,
 			lodPps = nil,
@@ -1037,6 +1054,7 @@ do
 			slot.lastCanvas = canvas
 			slot.surfaceGui.CanvasSize = canvas
 			rec.dirty = true
+			rec.job = nil -- the pixel mapping changed: a half-finished build is void
 		end
 		local px = rawW * rawH
 		totalCanvasPx = totalCanvasPx + px - (rec.canvasPx or 0)
@@ -1054,33 +1072,61 @@ do
 		rec.appliedPps = pps
 	end
 
-	local function rebuildTileStatic(rec)
+	-- Resumable: with `useBudget` it stops once this frame has created PrimCreateBudget GUI
+	-- frames and continues next frame (a big tile holds hundreds). Returns true when done.
+	local function rebuildTileStatic(rec, useBudget)
 		local pool = rec.slot.stat
 		local tile = rec.tile
-		beginPool(pool)
-		for _, list in pairs(rec.contrib) do
-			for i = 1, #list do
-				local ops = list[i].ops
-				local polys = ops.polys
-				for p = 1, #polys do
-					drawConvexPolygonOnTile(polys[p], tile, pool)
-				end
-				local rounds = ops.rounds
-				for r = 1, #rounds do
-					drawRoundShadowOnTile(rounds[r], tile, pool)
+		local job = rec.job
+		if not job then
+			job = { kinds = {}, items = {}, n = 0, idx = 1, stale = false }
+			for _, list in pairs(rec.contrib) do
+				for i = 1, #list do
+					local ops = list[i].ops
+					for p = 1, #ops.polys do
+						job.n = job.n + 1
+						job.kinds[job.n] = 1
+						job.items[job.n] = ops.polys[p]
+					end
+					for r = 1, #ops.rounds do
+						job.n = job.n + 1
+						job.kinds[job.n] = 2
+						job.items[job.n] = ops.rounds[r]
+					end
 				end
 			end
+			rec.job = job
+			beginPool(pool)
 		end
-		endPool(pool)
-		rec.dirty = false
+		while job.idx <= job.n do
+			local item = job.items[job.idx]
+			if job.kinds[job.idx] == 1 then
+				drawConvexPolygonOnTile(item, tile, pool)
+			else
+				drawRoundShadowOnTile(item, tile, pool)
+			end
+			job.idx = job.idx + 1
+			if useBudget and primCreatedFrame >= CONFIG.PrimCreateBudget then
+				break
+			end
+		end
+		if job.idx > job.n then
+			endPool(pool)
+			rec.job = nil
+			rec.dirty = job.stale
+			return true
+		end
+		return false
 	end
 
-	local function prepareBoundTile(rec)
+	-- Returns true when the tile is fully built (false = resume next frame).
+	local function prepareBoundTile(rec, useBudget)
 		local pps = chooseTilePps(rec, rec.dist)
 		applyTileGeometry(rec, pps)
 		if rec.dirty then
-			rebuildTileStatic(rec)
+			return rebuildTileStatic(rec, useBudget)
 		end
+		return true
 	end
 
 	-- Build queue: tiles whose static layer must be (re)drawn, nearest first.
@@ -1089,14 +1135,21 @@ do
 		local minPer = CONFIG.MinTilesBuiltPerFrame
 		while dirtyHead <= #dirtyQueue do
 			local rec = dirtyQueue[dirtyHead]
-			dirtyQueue[dirtyHead] = false
-			dirtyHead = dirtyHead + 1
-			rec.queued = false
+			local finished = true
 			if rec.wanted and (rec.dirty or not rec.slot or rec.appliedPps == nil) then
 				local slot = ensureTileBound(rec, rec.prio or rec.dist)
 				if slot then
-					prepareBoundTile(rec)
+					finished = prepareBoundTile(rec, true)
 				end
+			end
+			if not finished then
+				break -- frame budget spent: this tile resumes next frame
+			end
+			dirtyQueue[dirtyHead] = false
+			dirtyHead = dirtyHead + 1
+			rec.queued = false
+			if rec.dirty and rec.wanted and rec.slot then
+				enqueueTile(rec) -- it changed while it was being built: go again
 			end
 			processed = processed + 1
 			if processed >= minPer and os.clock() >= deadline then
@@ -1232,8 +1285,11 @@ do
 				return nil
 			end
 		end
-		if rec.dirty or rec.appliedPps == nil then
-			prepareBoundTile(rec)
+		if rec.appliedPps == nil then
+			applyTileGeometry(rec, chooseTilePps(rec, rec.dist))
+		end
+		if rec.dirty and rec.wanted then
+			enqueueTile(rec)
 		end
 		rec.lastDynFrame = currentFrameId
 		local slot = rec.slot
@@ -1272,6 +1328,7 @@ do
 				end
 			end
 		end
+		primCreatedFrame = 0
 		currentFrameId = currentFrameId + 1
 	end
 
