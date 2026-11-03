@@ -37,7 +37,7 @@
 	Print statistics every 5 s with Debug = true.
 ]]
 
-local VERSION = "v21"
+local VERSION = "v22"
 
 -- Wall-clock seconds for intervals (os.clock() is CPU time in Roblox and is only
 -- used for the sub-millisecond per-frame budgets).
@@ -106,6 +106,12 @@ local CONFIG = {
 	DynamicSlotReserve = 24,                -- Canvases kept free for moving (character) shadows
 	NearAlwaysRadius = 150,                 -- Tiles this close stay ready even when off-screen
 	SurfaceOffset = 0.03,                   -- Hover height above receiving surfaces
+	EdgeFeatherPx = 1.6,                    -- Soft, anti-aliased shadow edges: ramp width in canvas pixels (0 = hard edges)
+	EdgeBandPx = 4.0,                       -- (internal) thickness of one edge band, must stay above EdgeFeatherPx
+	EdgeBandExtend = 0.6,                   -- (internal) how far an edge band reaches past a blunt corner
+	TileFadeSeconds = 0.3,                  -- A newly built tile fades in over this long instead of popping (0 = off)
+	SoftEdgeMinPps = 6,                     -- Tiles coarser than this (far away) keep plain hard edges: cheaper
+	DynamicSoftEdges = true,                -- Soft edges on YOUR moving shadow (other characters use hard edges: cheaper)
 	TileRefreshInterval = 0.2,              -- Seconds between tile visibility / LOD updates
 
 	-- Distance -------------------------------------------------------------------
@@ -176,20 +182,21 @@ do
 local MOBILE_PRESET = {
 	PixelsPerStud = 14,
 	MinPixelsPerStud = 2,
-	MaxCanvasPixels = 384,
-	MaxActiveCanvasSlots = 72,
-	DynamicSlotReserve = 12,
-	NearAlwaysRadius = 90,
-	MaxMapCasters = 350,
+	MaxCanvasPixels = 448,
+	MaxActiveCanvasSlots = 120,
+	DynamicSlotReserve = 14,
+	NearAlwaysRadius = 120,
+	MaxMapCasters = 600,
 	MaxRenderDistance = 1800,
 	ScanSlice = 700,
 	MinBakePerFrame = 1,
 	BakeChecksPerFrame = 80,
 	BakeBudgetSeconds = 0.0015,
 	TileBuildBudgetSeconds = 0.001,
-	PrimCreateBudget = 45,
+	PrimCreateBudget = 50,
 	LightRebakeAngleDeg = 1.2,
 	MaxSilhouetteCharacters = 2,
+	FarHullDistance = 14,
 	MaxSilhouettePlanes = 1,
 	SilhouettePixelsPerStud = 24,
 	MaxSelfShadowHighlights = 3,
@@ -620,9 +627,9 @@ local function smoothstep(e0, e1, x)
 end
 
 local drawConvexPolygonOnTile, drawRoundShadowOnTile
-local setPrimitive, acquireRect, acquireDisc, getDynamicTile, tileRangeForBounds
+local setPrimitive, acquireRect, acquireDisc, acquireBand, getDynamicTile, tileRangeForBounds
 local addEntryToTiles, removeCasterContribs, processTileQueue, refreshTileStates
-local finalizeCanvasSlotsForFrame, getTileStats, collectStaticShadowPolys
+local finalizeCanvasSlotsForFrame, getTileStats, collectStaticShadowPolys, setDynamicSoft
 
 -- ============================================================================
 -- RETAINED CANVAS SLOTS: every receiver tile has a STATIC layer (map shadows,
@@ -639,53 +646,84 @@ do
 	local dynSlotsThisFrame = {}
 	local dynSlotsPrev = {}
 
+	-- sx, sy: 1 / canvas size the primitives of this pool are laid out against (primitives are
+	-- positioned in canvas FRACTIONS, so a resolution change needs no rebuild); soft: draw
+	-- anti-aliased edge bands.
 	local function newPool(holder, isDynamic)
-		return { holder = holder, dynamic = (isDynamic == true), rects = {}, discs = {}, nRect = 0, nDisc = 0, prevRect = 0, prevDisc = 0 }
+		return {
+			holder = holder, dynamic = (isDynamic == true), sx = 1 / 64, sy = 1 / 64, soft = false,
+			rects = {}, discs = {}, bands = {},
+			nRect = 0, nDisc = 0, nBand = 0, prevRect = 0, prevDisc = 0, prevBand = 0,
+		}
 	end
 
 	-- Creating a GUI Frame property by property is slow (and much slower on a phone):
 	-- clone a pre-configured template instead (one call per primitive).
-	local frameTemplate, discTemplate = nil, nil
+	local frameTemplate, discTemplate, bandTemplate = nil, nil, nil
 	local primCreatedFrame = 0
 
-	local function createPrimitive(pool, isDisc)
-		if not frameTemplate then
-			local f = Instance.new("Frame")
-			f.AnchorPoint = Vector2.new(0.5, 0.5)
-			f.BackgroundColor3 = CONFIG.ShadowColor
-			f.BackgroundTransparency = 0
-			f.BorderSizePixel = 0
-			f.Visible = false
-			frameTemplate = f
-			local d = f:Clone()
-			local corner = Instance.new("UICorner")
-			corner.CornerRadius = UDim.new(1, 0)
-			corner.Parent = d
-			discTemplate = d
+	local function ensureTemplates()
+		if frameTemplate then
+			return
 		end
-		local f = (isDisc and discTemplate or frameTemplate):Clone()
+		local f = Instance.new("Frame")
+		f.AnchorPoint = Vector2.new(0.5, 0.5)
+		f.BackgroundColor3 = CONFIG.ShadowColor
+		f.BackgroundTransparency = 0
+		f.BorderSizePixel = 0
+		f.Visible = false
+		frameTemplate = f
+		local d = f:Clone()
+		local corner = Instance.new("UICorner")
+		corner.CornerRadius = UDim.new(1, 0)
+		corner.Parent = d
+		discTemplate = d
+		-- Soft edge band: transparent on its outer side (left), opaque after EdgeFeatherPx.
+		local bnd = f:Clone()
+		local grad = Instance.new("UIGradient")
+		grad.Rotation = 0
+		local r = math.clamp(CONFIG.EdgeFeatherPx / CONFIG.EdgeBandPx, 0.05, 0.95)
+		grad.Transparency = NumberSequence.new({
+			NumberSequenceKeypoint.new(0, 1),
+			NumberSequenceKeypoint.new(r, 0),
+			NumberSequenceKeypoint.new(1, 0),
+		})
+		grad.Parent = bnd
+		bandTemplate = bnd
+	end
+
+	local function createPrimitive(pool, kind)
+		ensureTemplates()
+		local f = (kind == "disc" and discTemplate or (kind == "band" and bandTemplate or frameTemplate)):Clone()
 		f.Parent = pool.holder
 		primCreatedFrame = primCreatedFrame + 1
-		return { frame = f, x = -1e9, y = -1e9, w = -1, h = -1, rot = -1e9, shown = false }
+		return { frame = f, pool = pool, x = -1e9, y = -1e9, w = -1, h = -1, rot = -1e9, shown = false, sx = 0, sy = 0 }
 	end
 
 	-- Only writes properties that actually changed (GUI property writes are costly).
 	function setPrimitive(rec, x, y, w, h, rot)
+		local pool = rec.pool
+		local sx, sy = pool.sx, pool.sy
+		local frame = rec.frame
 		if not rec.shown then
 			rec.shown = true
-			rec.frame.Visible = true
+			frame.Visible = true
+		end
+		if rec.sx ~= sx or rec.sy ~= sy then
+			rec.sx, rec.sy = sx, sy
+			rec.x, rec.y, rec.w, rec.h = -1e9, -1e9, -1, -1
 		end
 		if math.abs(rec.x - x) > 0.05 or math.abs(rec.y - y) > 0.05 then
 			rec.x, rec.y = x, y
-			rec.frame.Position = UDim2.new(0, x, 0, y)
+			frame.Position = UDim2.new(x * sx, 0, y * sy, 0)
 		end
 		if math.abs(rec.w - w) > 0.05 or math.abs(rec.h - h) > 0.05 then
 			rec.w, rec.h = w, h
-			rec.frame.Size = UDim2.new(0, w, 0, h)
+			frame.Size = UDim2.new(w * sx, 0, h * sy, 0)
 		end
 		if math.abs(rec.rot - rot) > 0.02 then
 			rec.rot = rot
-			rec.frame.Rotation = rot
+			frame.Rotation = rot
 		end
 	end
 
@@ -701,7 +739,7 @@ do
 		pool.nRect = idx
 		local rec = pool.rects[idx]
 		if not rec then
-			rec = createPrimitive(pool, false)
+			rec = createPrimitive(pool, "rect")
 			pool.rects[idx] = rec
 		end
 		return rec
@@ -712,8 +750,19 @@ do
 		pool.nDisc = idx
 		local rec = pool.discs[idx]
 		if not rec then
-			rec = createPrimitive(pool, true)
+			rec = createPrimitive(pool, "disc")
 			pool.discs[idx] = rec
+		end
+		return rec
+	end
+
+	function acquireBand(pool)
+		local idx = pool.nBand + 1
+		pool.nBand = idx
+		local rec = pool.bands[idx]
+		if not rec then
+			rec = createPrimitive(pool, "band")
+			pool.bands[idx] = rec
 		end
 		return rec
 	end
@@ -721,6 +770,7 @@ do
 	local function beginPool(pool)
 		pool.nRect = 0
 		pool.nDisc = 0
+		pool.nBand = 0
 	end
 
 	local function endPool(pool)
@@ -730,8 +780,12 @@ do
 		for d = pool.nDisc + 1, pool.prevDisc do
 			hidePrimitive(pool.discs[d])
 		end
+		for b = pool.nBand + 1, pool.prevBand do
+			hidePrimitive(pool.bands[b])
+		end
 		pool.prevRect = pool.nRect
 		pool.prevDisc = pool.nDisc
+		pool.prevBand = pool.nBand
 	end
 
 	local function newHolder(parent, name)
@@ -799,6 +853,7 @@ do
 			enabled = false,
 			dynFrame = -1,
 			gt = currentGroupTransparency,
+			fade = 1,
 			lastSize = nil,
 			lastCF = nil,
 			lastCanvas = nil,
@@ -806,6 +861,7 @@ do
 	end
 
 	local totalCanvasPx = 0
+	local enabledCanvasPx = 0
 
 	-- A tile's canvas only renders while it is bound AND (probably) on screen.
 	local function syncSlotEnabled(slot)
@@ -832,6 +888,8 @@ do
 			rec.slot = nil
 			rec.dirty = true
 			rec.appliedPps = nil
+			rec.buildPps = nil
+			rec.pad = nil
 		end
 	end
 
@@ -927,6 +985,9 @@ do
 			dist = math.huge,
 			lastDynFrame = -1000,
 			prio = math.huge,
+			lastWantedFrame = -100000,
+			buildPps = nil,
+			pad = nil,
 			job = nil,
 			onScreen = true,
 			canvasPx = 0,
@@ -957,28 +1018,43 @@ do
 			canvasSlots[#canvasSlots + 1] = slot
 			return slot
 		end
-		local victim, victimScore = nil, -1
+		-- The slots are a cache of built tiles. A tile that is no longer wanted keeps its slot
+		-- (its canvas is simply not shown while off screen), so turning the camera back finds the
+		-- shadows ready. When a slot is needed the least valuable tile goes: first tiles nobody
+		-- wants (the longest unwanted first), then wanted tiles, but only to make room for one
+		-- that is clearly more important (a margin stops two tiles from swapping every frame).
+		local victim, victimValue = nil, math.huge
 		for i = 1, #canvasSlots do
 			local slot = canvasSlots[i]
 			local r = slot.rec
 			if r.lastDynFrame < currentFrameId - 2 then
-				local score = r.wanted and (r.prio or r.dist) or 1e9
-				if score > victimScore then
-					victim, victimScore = slot, score
+				local v
+				if r.wanted then
+					v = 1000 + 1e6 / ((r.prio or 1e9) + 1)
+				else
+					v = 1 / (1 + (currentFrameId - r.lastWantedFrame) * 0.01) + (r.onScreen and 0.5 or 0)
+				end
+				if v < victimValue then
+					victim, victimValue = slot, v
 				end
 			end
 		end
 		if not victim then
 			return nil
 		end
-		if victim.rec.wanted and victimScore <= priorityDist then
-			return nil
+		if victim.rec.wanted then
+			local reqValue = 1000 + 1e6 / (priorityDist + 1)
+			if reqValue < victimValue * 1.35 then
+				return nil
+			end
 		end
 		releaseTileSlot(victim.rec)
 		return victim
 	end
 
-	local function ensureTileBound(rec, priorityDist)
+	local fadingSlots = {}
+
+	local function ensureTileBound(rec, priorityDist, fadeIn)
 		local slot = rec.slot
 		if slot then
 			return slot
@@ -991,9 +1067,18 @@ do
 		rec.slot = slot
 		rec.dirty = true
 		rec.appliedPps = nil
-		if slot.gt ~= currentGroupTransparency then
-			slot.gt = currentGroupTransparency
-			slot.canvasGroup.GroupTransparency = currentGroupTransparency
+		if fadeIn and CONFIG.TileFadeSeconds > 0 then
+			-- A tile that shows up for the first time fades in instead of popping.
+			slot.fade = 0
+			slot.gt = 1
+			slot.canvasGroup.GroupTransparency = 1
+			fadingSlots[#fadingSlots + 1] = slot
+		else
+			slot.fade = 1
+			if slot.gt ~= currentGroupTransparency then
+				slot.gt = currentGroupTransparency
+				slot.canvasGroup.GroupTransparency = currentGroupTransparency
+			end
 		end
 		beginPool(slot.stat)
 		endPool(slot.stat)
@@ -1028,12 +1113,30 @@ do
 		local slot = rec.slot
 		local plane = rec.plane
 		local w2, h2 = rec.halfU * 2, rec.halfV * 2
-		local rawW = math.clamp(math.ceil(w2 * pps), 16, CONFIG.MaxCanvasPixels)
-		local rawH = math.clamp(math.ceil(h2 * pps), 16, CONFIG.MaxCanvasPixels)
+
+		-- A big resolution jump needs a rebuild (edge softness and overlaps are measured in
+		-- pixels); smaller changes only resize the canvas, the primitives are canvas fractions.
+		local bp = rec.buildPps
+		if not bp or pps > bp * 2.1 or pps < bp * 0.48 then
+			rec.pad = nil
+			rec.buildPps = nil
+			rec.dirty = true
+			rec.job = nil
+		end
+		-- The canvas reaches `pad` studs beyond the tile on every side, so neighbouring tiles
+		-- overlap and no hairline can open between them (fixed until the next rebuild).
+		local pad = rec.pad
+		if not pad then
+			pad = math.clamp(2.5 / pps, 0.04, 0.6)
+			rec.pad = pad
+		end
+		local cw2, ch2 = w2 + pad * 2, h2 + pad * 2
+		local rawW = math.clamp(math.ceil(cw2 * pps), 16, CONFIG.MaxCanvasPixels)
+		local rawH = math.clamp(math.ceil(ch2 * pps), 16, CONFIG.MaxCanvasPixels)
 
 		-- Depth precision drops with distance: lift far shadows a little more.
 		local offset = CONFIG.SurfaceOffset + math.min(math.floor(math.max(rec.dist, 0) / 60), 12) * 0.015
-		local size = Vector3.new(w2, h2, 0.01)
+		local size = Vector3.new(cw2, ch2, 0.01)
 		local cf = CFrame.fromMatrix(
 			rec.origin + plane.normal * offset,
 			-plane.tangentU,
@@ -1053,8 +1156,6 @@ do
 		if slot.lastCanvas ~= canvas then
 			slot.lastCanvas = canvas
 			slot.surfaceGui.CanvasSize = canvas
-			rec.dirty = true
-			rec.job = nil -- the pixel mapping changed: a half-finished build is void
 		end
 		local px = rawW * rawH
 		totalCanvasPx = totalCanvasPx + px - (rec.canvasPx or 0)
@@ -1066,20 +1167,37 @@ do
 		tile.centerV = rec.centerV
 		tile.halfU = rec.halfU
 		tile.halfV = rec.halfV
-		tile.scaleX = rawW / w2
-		tile.scaleY = rawH / h2
+		tile.scaleX = rawW / cw2
+		tile.scaleY = rawH / ch2
+		tile.pad = pad
+		tile.ovl = 0.6 * 2 / (tile.scaleX + tile.scaleY)
 		tile.pps = pps
 		rec.appliedPps = pps
+
+		-- The dynamic layer is redrawn every frame, so it always follows the current canvas.
+		local dyn = slot.dyn
+		dyn.sx, dyn.sy = 1 / rawW, 1 / rawH
 	end
 
 	-- Resumable: with `useBudget` it stops once this frame has created PrimCreateBudget GUI
 	-- frames and continues next frame (a big tile holds hundreds). Returns true when done.
 	local function rebuildTileStatic(rec, useBudget)
 		local pool = rec.slot.stat
-		local tile = rec.tile
 		local job = rec.job
 		if not job then
-			job = { kinds = {}, items = {}, n = 0, idx = 1, stale = false }
+			local t0 = rec.tile
+			local cv = rec.slot.lastCanvas
+			job = {
+				kinds = {}, items = {}, n = 0, idx = 1, stale = false,
+				-- the mapping this build is laid out against (frozen: the canvas may be resized
+				-- by a resolution change while the build is still running)
+				tile = {
+					centerU = t0.centerU, centerV = t0.centerV, halfU = t0.halfU, halfV = t0.halfV,
+					scaleX = t0.scaleX, scaleY = t0.scaleY, pad = t0.pad, ovl = t0.ovl, pps = t0.pps,
+					isCircularDisk = t0.isCircularDisk, diskRadius = t0.diskRadius,
+				},
+				cw = cv.X, ch = cv.Y,
+			}
 			for _, list in pairs(rec.contrib) do
 				for i = 1, #list do
 					local ops = list[i].ops
@@ -1096,8 +1214,12 @@ do
 				end
 			end
 			rec.job = job
+			rec.buildPps = job.tile.pps
 			beginPool(pool)
+			pool.sx, pool.sy = 1 / job.cw, 1 / job.ch
+			pool.soft = CONFIG.EdgeFeatherPx > 0 and job.tile.pps >= CONFIG.SoftEdgeMinPps
 		end
+		local tile = job.tile
 		while job.idx <= job.n do
 			local item = job.items[job.idx]
 			if job.kinds[job.idx] == 1 then
@@ -1136,8 +1258,8 @@ do
 		while dirtyHead <= #dirtyQueue do
 			local rec = dirtyQueue[dirtyHead]
 			local finished = true
-			if rec.wanted and (rec.dirty or not rec.slot or rec.appliedPps == nil) then
-				local slot = ensureTileBound(rec, rec.prio or rec.dist)
+			if rec.wanted then
+				local slot = ensureTileBound(rec, rec.prio or rec.dist, true)
 				if slot then
 					finished = prepareBoundTile(rec, true)
 				end
@@ -1170,14 +1292,34 @@ do
 	local lastRefreshTime = -1e9
 	local TILE_SCAN_SLICE = 400
 
+	local budgetOver, budgetUnder = 0, 0
 	local function finishTileRefresh()
-		local maxStatic = math.floor((CONFIG.MaxActiveCanvasSlots - CONFIG.DynamicSlotReserve) * (0.4 + 0.6 * qualityLevel))
-		-- Keep the total canvas memory inside its budget by lowering resolution a step at a time.
-		local budget = CONFIG.CanvasPixelBudget * (0.4 + 0.6 * qualityLevel)
-		if totalCanvasPx > budget * 1.05 then
-			lodBudgetStep = math.max(0.3, lodBudgetStep * 0.88)
-		elseif totalCanvasPx < budget * 0.6 and lodBudgetStep < 1 then
-			lodBudgetStep = math.min(1, lodBudgetStep * 1.06)
+		local maxStatic = math.floor((CONFIG.MaxActiveCanvasSlots - CONFIG.DynamicSlotReserve) * (0.5 + 0.5 * qualityLevel))
+		-- Only canvases that are actually shown cost rendering time. The resolution moves slowly
+		-- (about a second to react, several seconds to recover) so tiles are not rebuilt in turn.
+		local enabledPx = 0
+		for i = 1, #canvasSlots do
+			local s = canvasSlots[i]
+			if s.enabled and s.rec then
+				enabledPx = enabledPx + (s.rec.canvasPx or 0)
+			end
+		end
+		enabledCanvasPx = enabledPx
+		local budget = CONFIG.CanvasPixelBudget * (0.5 + 0.5 * qualityLevel)
+		if enabledPx > budget * 1.1 then
+			budgetOver, budgetUnder = budgetOver + 1, 0
+			if budgetOver >= 4 then
+				budgetOver = 0
+				lodBudgetStep = math.max(0.35, lodBudgetStep * 0.9)
+			end
+		elseif enabledPx < budget * 0.6 and lodBudgetStep < 1 then
+			budgetUnder, budgetOver = budgetUnder + 1, 0
+			if budgetUnder >= 12 then
+				budgetUnder = 0
+				lodBudgetStep = math.min(1, lodBudgetStep * 1.08)
+			end
+		else
+			budgetOver, budgetUnder = 0, 0
 		end
 		-- Importance ~ apparent size: how much shadow a tile holds versus how far away it is.
 		-- A big far shadow then beats a tiny near one when slots are scarce.
@@ -1213,8 +1355,8 @@ do
 		end
 		for i = 1, #canvasSlots do
 			local rec = canvasSlots[i].rec
-			if rec and not rec.wanted and (currentFrameId - rec.lastDynFrame) > 20 then
-				releaseTileSlot(rec)
+			if rec and rec.nContrib == 0 and (currentFrameId - rec.lastDynFrame) > 20 then
+				releaseTileSlot(rec) -- nothing left to show on it
 			end
 		end
 	end
@@ -1249,6 +1391,9 @@ do
 					end
 				end
 				rec.wanted = wanted
+				if wanted then
+					rec.lastWantedFrame = currentFrameId
+				end
 				if rec.slot then
 					local on = (currentFrameId - rec.lastDynFrame) < 20 or isSphereOnScreen(rec.origin, rec.radius * 1.3)
 					if rec.onScreen ~= on then
@@ -1274,6 +1419,13 @@ do
 	-- ----------------------------------------------------------------------------
 	-- Dynamic layer access (characters)
 	-- ----------------------------------------------------------------------------
+	-- Soft (anti-aliased) edges cost extra primitives every frame, so only the shadows that are
+	-- worth it ask for them (your own).
+	local dynSoftFlag = false
+	function setDynamicSoft(flag)
+		dynSoftFlag = flag and CONFIG.EdgeFeatherPx > 0
+	end
+
 	function getDynamicTile(plane, tx, ty)
 		local rec = getTileRec(plane, tx, ty)
 		if not rec then
@@ -1293,6 +1445,7 @@ do
 		end
 		rec.lastDynFrame = currentFrameId
 		local slot = rec.slot
+		slot.dyn.soft = dynSoftFlag and rec.tile.pps >= CONFIG.SoftEdgeMinPps
 		if slot.dynFrame ~= currentFrameId then
 			slot.dynFrame = currentFrameId
 			beginPool(slot.dyn)
@@ -1302,6 +1455,7 @@ do
 	end
 
 	local appliedGroupTransparency = currentGroupTransparency
+	local lastFinalizeTime = wallNow()
 	function finalizeCanvasSlotsForFrame()
 		for i = 1, #dynSlotsPrev do
 			local slot = dynSlotsPrev[i]
@@ -1318,11 +1472,39 @@ do
 		end
 		clearTable(dynSlotsThisFrame)
 
+		local nowT = wallNow()
+		local fdt = math.clamp(nowT - lastFinalizeTime, 0, 0.1)
+		lastFinalizeTime = nowT
+		if #fadingSlots > 0 then
+			local keepN = 0
+			for i = 1, #fadingSlots do
+				local slot = fadingSlots[i]
+				if slot.rec and slot.fade < 1 then
+					slot.fade = math.min(1, slot.fade + fdt / CONFIG.TileFadeSeconds)
+					local e = slot.fade * slot.fade * (3 - 2 * slot.fade)
+					local g = 1 - (1 - currentGroupTransparency) * e
+					if slot.fade >= 1 then
+						g = currentGroupTransparency
+					end
+					if math.abs(slot.gt - g) > 0.004 or slot.fade >= 1 then
+						slot.gt = g
+						slot.canvasGroup.GroupTransparency = g
+					end
+					if slot.fade < 1 then
+						keepN = keepN + 1
+						fadingSlots[keepN] = slot
+					end
+				end
+			end
+			for i = #fadingSlots, keepN + 1, -1 do
+				fadingSlots[i] = nil
+			end
+		end
 		if math.abs(appliedGroupTransparency - currentGroupTransparency) > 0.004 then
 			appliedGroupTransparency = currentGroupTransparency
 			for i = 1, #canvasSlots do
 				local slot = canvasSlots[i]
-				if slot.rec and slot.gt ~= currentGroupTransparency then
+				if slot.rec and slot.fade >= 1 and slot.gt ~= currentGroupTransparency then
 					slot.gt = currentGroupTransparency
 					slot.canvasGroup.GroupTransparency = currentGroupTransparency
 				end
@@ -1471,7 +1653,7 @@ do
 			if slot.rec then
 				bound = bound + 1
 			end
-			prims = prims + slot.stat.prevRect + slot.stat.prevDisc + slot.dyn.prevRect + slot.dyn.prevDisc
+			prims = prims + slot.stat.prevRect + slot.stat.prevDisc + slot.stat.prevBand + slot.dyn.prevRect + slot.dyn.prevDisc + slot.dyn.prevBand
 		end
 		return bound, #tileRecList, prims, #dirtyQueue - dirtyHead + 1
 	end
@@ -1729,10 +1911,11 @@ function drawRoundShadowOnTile(r, tile, pool)
 		return
 	end
 	local scale = (tile.scaleX + tile.scaleY) * 0.5
-	local x1 = (r.u1 - tile.centerU + tile.halfU) * tile.scaleX
-	local y1 = (-r.v1 + tile.centerV + tile.halfV) * tile.scaleY
-	local x2 = (r.u2 - tile.centerU + tile.halfU) * tile.scaleX
-	local y2 = (-r.v2 + tile.centerV + tile.halfV) * tile.scaleY
+	local pad = tile.pad or 0
+	local x1 = (r.u1 - tile.centerU + tile.halfU + pad) * tile.scaleX
+	local y1 = (-r.v1 + tile.centerV + tile.halfV + pad) * tile.scaleY
+	local x2 = (r.u2 - tile.centerU + tile.halfU + pad) * tile.scaleX
+	local y2 = (-r.v2 + tile.centerV + tile.halfV + pad) * tile.scaleY
 
 	local rMinorPx = math.max(1.2, r.rMinor * scale)
 	local rMajorPx = math.max(rMinorPx, r.rMajor * scale)
@@ -1750,24 +1933,31 @@ function drawRoundShadowOnTile(r, tile, pool)
 end
 
 -- ============================================================================
--- CONVEX POLYGON FILL (pixel space)
+-- CONVEX POLYGON FILL (pixel space) with SOFT, ANTI-ALIASED EDGES
 -- ============================================================================
--- A GUI Frame can only be a rectangle, so a polygon is built from rotated rectangles:
---   * STRIPS along the best axis, measured with INNER chords (they never poke outside).
---   * graded BANDS along every slanted edge: the exact edge, they also close the gaps the
---     strips leave beside slanted sides and reach into sharp tips.
---   * every internal boundary overlaps by a pixel or two, so rotated edges never leave seams.
--- Measured on 1,100 random shadow-like polygons (offline coverage test): about 20 primitives
--- (the old method used ~36), the largest hole ~50 px^2 (was ~1,800 px^2) and no overshoot.
+-- A GUI Frame can only be a rectangle, so a polygon is built from rectangles:
+--   * the INTERIOR (the polygon shrunk by half a feather width) is filled with STRIPS
+--     measured with inner chords (they never poke outside);
+--   * every real EDGE gets one thin BAND: a rotated rectangle that fades from transparent
+--     (outside) to opaque (inside) over EdgeFeatherPx pixels (a UIGradient). The ramp is
+--     evaluated per pixel, so an edge is anti-aliased at ANY angle and resolution (no
+--     stair-steps) and the band also covers the gaps the strips leave beside slanted sides;
+--   * an edge that only exists because the polygon was cut at a tile border is NOT
+--     feathered: it stays hard and reaches slightly into the neighbouring tile, so there is
+--     no seam between tiles.
+-- EdgeFeatherPx = 0 selects the previous hard-edged fill (strips + graded bands).
 do
 local diskClipCache = {}
 
 local OVERLAP = 1.6
 local fillPool = nil
+local stripTol = 1.2 -- px an inscribed strip may lose beside a slanted side
 
 local function emit(kind, cx, cy, w, h, rot)
 	if kind == "disc" then
 		setPrimitive(acquireDisc(fillPool), cx, cy, w, h, 0)
+	elseif kind == "band" then
+		setPrimitive(acquireBand(fillPool), cx, cy, w, h, rot)
 	else
 		setPrimitive(acquireRect(fillPool), cx, cy, w, h, rot)
 	end
@@ -1806,25 +1996,39 @@ local function simplifyPoly(poly)
 	return out
 end
 
-local function toLocal(poly, dx, dy)
-	-- rotation into the axis frame: x' = p.d , y' = p.n  with n = (-dy, dx)
-	local out = {}
-	for i = 1, #poly do
-		local p = poly[i]
-		out[i] = Vector2.new(p.X * dx + p.Y * dy, -p.X * dy + p.Y * dx)
-	end
-	return out
-end
+-- Everything below works on plain number arrays (xs[i], ys[i]): this runs for every moving
+-- polygon every frame, and indexing Vector2 values is slow.
 
--- Chord of the polygon at height y (nil outside). Heights are clamped half a pixel inside
--- the polygon so an edge that is parallel to the strips up to a tiny tilt still has a
--- usable chord at the extreme level.
-local function chordAt(lp, y, ymin, ymax)
+-- Horizontal chord [xl, xr] of a convex polygon at height y (nil if missed). Heights are
+-- clamped half a pixel inside [ymin, ymax] so an edge that is parallel to the strips up to a
+-- tiny tilt still has a usable chord at the extreme level.
+local function chordAt(lx, ly, n, y, ymin, ymax)
 	if ymin then
-		y = math.max(ymin + 0.5, math.min(ymax - 0.5, y))
+		local lo, hi = ymin + 0.5, ymax - 0.5
+		if y < lo then y = lo elseif y > hi then y = hi end
 	end
-	local xl, xr = convexChordAtY(lp, y)
-	if not xl then
+	local xl, xr = 1e30, -1e30
+	local px, py = lx[n], ly[n]
+	for i = 1, n do
+		local cx, cy = lx[i], ly[i]
+		local lo, hi = py, cy
+		if lo > hi then lo, hi = hi, lo end
+		if y >= lo - 1e-9 and y <= hi + 1e-9 then
+			local dy = cy - py
+			if dy < 1e-9 and dy > -1e-9 then
+				if px < xl then xl = px end
+				if px > xr then xr = px end
+				if cx < xl then xl = cx end
+				if cx > xr then xr = cx end
+			else
+				local x = px + (y - py) * (cx - px) / dy
+				if x < xl then xl = x end
+				if x > xr then xr = x end
+			end
+		end
+		px, py = cx, cy
+	end
+	if xl > xr then
 		return nil, nil
 	end
 	return xl, xr
@@ -1832,15 +2036,17 @@ end
 
 -- Vertex levels of the polygon in the axis frame (strips follow them, so every piece
 -- between two levels has exactly straight sides).
-local function levelsOf(lp, ymin, ymax)
+local function levelsOf(ly, n, ymin, ymax)
 	local ys = {}
-	for i = 1, #lp do ys[i] = lp[i].Y end
+	for i = 1, n do ys[i] = ly[i] end
 	table.sort(ys)
 	local out = { ymin }
-	for i = 1, #ys do
+	local last = ymin
+	for i = 1, n do
 		local y = ys[i]
-		if y > out[#out] + 0.6 and y < ymax - 0.6 then
+		if y > last + 0.6 and y < ymax - 0.6 then
 			out[#out + 1] = y
+			last = y
 		end
 	end
 	out[#out + 1] = ymax
@@ -1848,12 +2054,14 @@ local function levelsOf(lp, ymin, ymax)
 end
 
 -- Strip schedule shared by counting and emitting. visit(y0, y1) per strip.
-local function stripSchedule(lp, levels, tBase, tmin, visit)
+local function stripSchedule(lx, ly, n, levels, tBase, tmin, visit)
 	local count = 0
-	for k = 1, #levels - 1 do
+	local nl = #levels
+	local y0all, y1all = levels[1], levels[nl]
+	local l0, r0 = chordAt(lx, ly, n, levels[1], y0all, y1all)
+	for k = 1, nl - 1 do
 		local ya, yb = levels[k], levels[k + 1]
-		local l0, r0 = chordAt(lp, ya, levels[1], levels[#levels])
-		local l1, r1 = chordAt(lp, yb, levels[1], levels[#levels])
+		local l1, r1 = chordAt(lx, ly, n, yb, y0all, y1all)
 		if l0 and l1 then
 			if math.abs(l1 - l0) < 0.15 and math.abs(r1 - r0) < 0.15 then
 				-- both sides parallel to the axis: a single strip
@@ -1864,93 +2072,120 @@ local function stripSchedule(lp, levels, tBase, tmin, visit)
 				-- A strip loses at most (slope * thickness) of width at its slanted ends. Where
 				-- the sides are almost parallel to the strip direction (slope ~ 0) strips can
 				-- be thick; steep sides get thin strips and the edge bands finish the job.
-				local slope = math.max(math.abs(l1 - l0), math.abs(r1 - r0)) / len
-				local tAllow = math.min(math.max(tBase, 1.2 / math.max(slope, 1e-6)), 48)
-				local n = math.min(400, math.max(1, math.ceil(len / tAllow - 1e-6)))
-				local t = len / n
-				if t < tmin and n > 1 then
-					n = math.max(1, math.floor(len / tmin))
-					t = len / n
+				local dl, dr = l1 - l0, r1 - r0
+				if dl < 0 then dl = -dl end
+				if dr < 0 then dr = -dr end
+				local slope = (dl > dr and dl or dr) / len
+				if slope < 1e-6 then slope = 1e-6 end
+				local tAllow = stripTol / slope
+				if tAllow < tBase then tAllow = tBase end
+				if tAllow > 48 then tAllow = 48 end
+				local cnt = math.ceil(len / tAllow - 1e-6)
+				if cnt < 1 then cnt = 1 elseif cnt > 400 then cnt = 400 end
+				local t = len / cnt
+				if t < tmin and cnt > 1 then
+					cnt = math.floor(len / tmin)
+					if cnt < 1 then cnt = 1 end
+					t = len / cnt
 				end
-				for j = 0, n - 1 do
+				for j = 0, cnt - 1 do
 					count = count + 1
-					if visit then visit(ya + j * t, (j == n - 1) and yb or (ya + (j + 1) * t)) end
+					if visit then visit(ya + j * t, (j == cnt - 1) and yb or (ya + (j + 1) * t)) end
 				end
 			end
 		end
+		l0, r0 = l1, r1
 	end
 	return count
 end
 
+local function rotateInto(xs, ys, n, dx, dy)
+	local lx, ly = {}, {}
+	for i = 1, n do
+		local x, y = xs[i], ys[i]
+		lx[i] = x * dx + y * dy
+		ly[i] = -x * dy + y * dx
+	end
+	return lx, ly
+end
+
 -- Chooses the strip axis and the strip thickness. The thickness must stay below the
 -- polygon's own minimum width (otherwise the inner chord vanishes on thin slivers).
-local function chooseAxis(poly, maxDim, opts)
-	local candidates = { { 1, 0 }, { 0, 1 } }
-	local n = #poly
-	-- axes of the three longest edges
+local function chooseAxis(xs, ys, n, maxDim, opts)
+	local candidates = opts.edgeAxisOnly and {} or { { 1, 0 }, { 0, 1 } }
+	-- axes of the longest edges (one for moving shapes, three otherwise)
 	local top = {}
 	for i = 1, n do
-		local a, b = poly[i], poly[i % n + 1]
-		local e = b - a
-		local len = e.Magnitude
+		local j = i % n + 1
+		local ex, ey = xs[j] - xs[i], ys[j] - ys[i]
+		local len = math.sqrt(ex * ex + ey * ey)
 		if len > 3 then
-			top[#top + 1] = { len, e.X / len, e.Y / len }
+			top[#top + 1] = { len, ex / len, ey / len }
 		end
 	end
 	table.sort(top, function(p, q)
 		return p[1] > q[1]
 	end)
-	for i = 1, math.min(3, #top) do
+	for i = 1, math.min(opts.axes or 3, #top) do
 		candidates[#candidates + 1] = { top[i][2], top[i][3] }
 	end
-	local minWidth = math.huge
+	if #candidates == 0 then
+		candidates[1] = { 1, 0 }
+	end
+	local minWidth = 1e30
 	for _, c in ipairs(candidates) do
-		local lp = toLocal(poly, c[1], c[2])
-		local ymin, ymax = math.huge, -math.huge
-		for _, p in ipairs(lp) do
-			if p.Y < ymin then ymin = p.Y end
-			if p.Y > ymax then ymax = p.Y end
+		local lx, ly = rotateInto(xs, ys, n, c[1], c[2])
+		local ymin, ymax = 1e30, -1e30
+		for i = 1, n do
+			local y = ly[i]
+			if y < ymin then ymin = y end
+			if y > ymax then ymax = y end
 		end
-		c.lp, c.ymin, c.ymax = lp, ymin, ymax
+		c.lx, c.ly, c.ymin, c.ymax = lx, ly, ymin, ymax
 		local ext = ymax - ymin
 		if ext < minWidth then minWidth = ext end
 	end
 	local tCap = opts.tCap or math.clamp((opts.capFrac or 0.03) * maxDim, 3, opts.capMax or 12)
 	local tBase = math.clamp(0.45 * minWidth, 0.9, tCap)
 	local tmin = math.min(opts.tmin or 1.5, tBase * 0.6)
-	local best, bestCost = nil, math.huge
+	local best, bestCost = nil, 1e30
 	for _, c in ipairs(candidates) do
-		local cost = stripSchedule(c.lp, levelsOf(c.lp, c.ymin, c.ymax), tBase, tmin, nil)
+		local cost = stripSchedule(c.lx, c.ly, n, levelsOf(c.ly, n, c.ymin, c.ymax), tBase, tmin, nil)
 		if cost < bestCost then
 			best, bestCost = c, cost
 		end
 	end
-	return best[1], best[2], tBase, tmin
+	return best[1], best[2], tBase, tmin, best
 end
 
 -- inner-safe interval [u0,u1] along edge i for a band of depth T
-local function bandInterval(poly, normals, i, ex, ey, mx, my, T)
-	local n = #poly
-	local A = poly[i]
-	local L = (poly[i % n + 1] - A).Magnitude
+local function bandInterval(xs, ys, nxs, nys, n, i, ex, ey, mx, my, T)
+	local ax, ay = xs[i], ys[i]
+	local j2 = i % n + 1
+	local ddx, ddy = xs[j2] - ax, ys[j2] - ay
+	local L = math.sqrt(ddx * ddx + ddy * ddy)
 	local lo, hi = 0, L
 	for j = 1, n do
 		if j ~= i then
-			local nx, ny = normals[j].X, normals[j].Y
-			local Aj = poly[j]
-			local c = nx * Aj.X + ny * Aj.Y
+			local nx, ny = nxs[j], nys[j]
+			local c = nx * xs[j] + ny * ys[j]
 			local a = nx * ex + ny * ey
-			for _, v in ipairs({ 0, T }) do
-				local b = nx * A.X + ny * A.Y + (nx * mx + ny * my) * v - c
-				if math.abs(a) < 1e-9 then
-					if b < -0.05 then
-						return nil
-					end
-				elseif a > 0 then
-					lo = math.max(lo, (-0.05 - b) / a)
-				else
-					hi = math.min(hi, (-0.05 - b) / a)
+			local b0 = nx * ax + ny * ay - c
+			local b1 = b0 + (nx * mx + ny * my) * T
+			if a > -1e-9 and a < 1e-9 then
+				if b0 < -0.05 or b1 < -0.05 then
+					return nil
 				end
+			elseif a > 0 then
+				local v0 = (-0.05 - b0) / a
+				local v1 = (-0.05 - b1) / a
+				if v0 > lo then lo = v0 end
+				if v1 > lo then lo = v1 end
+			else
+				local v0 = (-0.05 - b0) / a
+				local v1 = (-0.05 - b1) / a
+				if v0 < hi then hi = v0 end
+				if v1 < hi then hi = v1 end
 			end
 		end
 	end
@@ -1962,9 +2197,155 @@ end
 
 -- Moving shapes (characters) are redrawn every frame, so they use a slightly coarser fill.
 local STATIC_FILL = {}
-local MOVING_FILL = { capFrac = 0.08, capMax = 14 }
+local MOVING_FILL = { capFrac = 0.08, capMax = 14, axes = 1, edgeAxisOnly = true }
 
-local function fillConvexPx(polyIn, pool)
+-- Strips (inner chords) covering the polygon. Returns the count and the axis that was used.
+local function emitStrips(xs, ys, n, opts)
+	local minX, maxX, minY, maxY = 1e30, -1e30, 1e30, -1e30
+	for i = 1, n do
+		local x, y = xs[i], ys[i]
+		if x < minX then minX = x end
+		if x > maxX then maxX = x end
+		if y < minY then minY = y end
+		if y > maxY then maxY = y end
+	end
+	local maxDim = math.max(maxX - minX, maxY - minY)
+	local dx, dy, tBase, tmin, cand = chooseAxis(xs, ys, n, maxDim, opts)
+	local lx, ly = cand.lx, cand.ly
+	local ymin, ymax = cand.ymin, cand.ymax
+	local rot = math.deg(math.atan2(dy, dx))
+	local nxx, nyy = -dy, dx
+	local emitted = 0
+	stripSchedule(lx, ly, n, levelsOf(ly, n, ymin, ymax), tBase, tmin, function(ya, yb)
+		-- width = inner chord of the strip's OWN range; only the thickness grows by the
+		-- overlap (perpendicular overshoot stays below OVERLAP/2 px).
+		local a = (ya <= ymin + 1e-6) and ya or (ya - OVERLAP * 0.5)
+		local b = (yb >= ymax - 1e-6) and yb or (yb + OVERLAP * 0.5)
+		local l0, r0 = chordAt(lx, ly, n, ya, ymin, ymax)
+		local l1, r1 = chordAt(lx, ly, n, yb, ymin, ymax)
+		if l0 and l1 then
+			local xl = l0 > l1 and l0 or l1
+			local xr = r0 < r1 and r0 or r1
+			if xr - xl > 0.6 then
+				local cx, cy = (xl + xr) * 0.5, (a + b) * 0.5
+				emit("rect", dx * cx + nxx * cy, dy * cx + nyy * cy, xr - xl, b - a, rot)
+				emitted = emitted + 1
+			end
+		end
+	end)
+	return emitted, dx, dy, tBase
+end
+
+-- Is the edge (ax,ay)-(bx,by) a cut along the tile's content rectangle (a tile-border cut)?
+local function isBorderEdge(ax, ay, bx, by, clip)
+	if not clip then
+		return false
+	end
+	local tol = 0.1
+	return (math.abs(ax - clip.x0) < tol and math.abs(bx - clip.x0) < tol)
+		or (math.abs(ax - clip.x1) < tol and math.abs(bx - clip.x1) < tol)
+		or (math.abs(ay - clip.y0) < tol and math.abs(by - clip.y0) < tol)
+		or (math.abs(ay - clip.y1) < tol and math.abs(by - clip.y1) < tol)
+end
+
+local function edgeNormals(xs, ys, n)
+	local nxs, nys = {}, {}
+	for i = 1, n do
+		local j = i % n + 1
+		local ex, ey = xs[j] - xs[i], ys[j] - ys[i]
+		local len = math.sqrt(ex * ex + ey * ey)
+		if len < 1e-6 then len = 1 end
+		nxs[i], nys[i] = -ey / len, ex / len
+	end
+	return nxs, nys
+end
+
+-- Hard-edged fill: strips + graded opaque bands along slanted edges. `softMinT` is the
+-- thinnest graded band along a REAL edge (the soft edge band covers the outer few pixels);
+-- tile-border cuts always go down to 1.2 px so they stay exact.
+local function fillConvexHard(xs, ys, n, nxs, nys, opts, clip, softMinT)
+	stripTol = 1.2
+	local emitted, dx, dy, tBase = emitStrips(xs, ys, n, opts)
+	local T0 = tBase + OVERLAP + 0.6
+	for i = 1, n do
+		local j = i % n + 1
+		local ax, ay = xs[i], ys[i]
+		local ex, ey = xs[j] - ax, ys[j] - ay
+		local len = math.sqrt(ex * ex + ey * ey)
+		if len > 3 then
+			ex, ey = ex / len, ey / len
+			local cosA = math.abs(ex * dx + ey * dy)          -- 1 = parallel to the strip axis
+			local sinA = math.sqrt(math.max(0, 1 - cosA * cosA))
+			-- flush with the strips only if the edge drifts < 0.7 px over its whole length
+			if not (len * sinA < 0.7) and not (len * cosA < 0.7) then
+				local minT = 1.2
+				if softMinT and not isBorderEdge(ax, ay, xs[j], ys[j], clip) then
+					minT = softMinT
+				end
+				local mx, my = nxs[i], nys[i]
+				-- Graded bands: deep first, then thinner and thinner. Thin bands fit closer
+				-- to acute tips, so together they cover them.
+				local T = T0
+				local rotE = math.deg(math.atan2(ey, ex))
+				local lastU0, lastU1 = nil, nil
+				local guard = 0
+				while T >= minT and guard < 12 do
+					guard = guard + 1
+					local u0, u1 = bandInterval(xs, ys, nxs, nys, n, i, ex, ey, mx, my, T)
+					if u0 and not (lastU0 and u0 >= lastU0 - 0.5 and u1 <= lastU1 + 0.5) then
+						local um = (u0 + u1) * 0.5
+						emit("rect", ax + ex * um + mx * (T * 0.5), ay + ey * um + my * (T * 0.5), u1 - u0, T, rotE)
+						emitted = emitted + 1
+						lastU0, lastU1 = u0, u1
+					end
+					T = T * 0.45
+				end
+			end
+		end
+	end
+	return emitted
+end
+
+-- Soft-edged fill. `clip` = {x0, x1, y0, y1}: the content rectangle of the tile (edges lying
+-- on it are tile-border cuts, not real shadow edges).
+--   1) the polygon itself, exact and hard (strips + graded bands, see fillConvexHard);
+--   2) a SKIRT along every real edge: a band that fades from transparent (EdgeFeatherPx outside
+--      the edge) to opaque (at the edge) and stays opaque for a couple of pixels inside, which
+--      hides the stair-steps of step 1 and softens the edge. Because the skirt only ever lies
+--      outside or on top of the polygon, two shadows that touch (or tile borders) never show a seam.
+local function fillConvexSoft(xs, ys, n, nxs, nys, opts, clip)
+	local f = CONFIG.EdgeFeatherPx
+	local Tk = CONFIG.EdgeBandPx
+	local depth = Tk - f                 -- opaque depth of the skirt inside the polygon
+	local emitted = fillConvexHard(xs, ys, n, nxs, nys, opts, clip, depth - 0.2)
+
+	-- A short edge of a small moving shape does not show a stair-step worth a primitive.
+	local minLen = fillPool.dynamic and 6 or 0.9
+	local ext = CONFIG.EdgeBandExtend
+	for i = 1, n do
+		local j = i % n + 1
+		local ax, ay = xs[i], ys[i]
+		local ex, ey = xs[j] - ax, ys[j] - ay
+		local len = math.sqrt(ex * ex + ey * ey)
+		if len > minLen and not isBorderEdge(ax, ay, xs[j], ys[j], clip) then
+			local nx, ny = nxs[i], nys[i]
+			ex, ey = ny, -nx
+			local u0, u1 = bandInterval(xs, ys, nxs, nys, n, i, ex, ey, nx, ny, depth)
+			if u0 then
+				local s0, s1 = u0, u1
+				if s0 <= 0.01 then s0 = -ext end
+				if s1 >= len - 0.01 then s1 = len + ext end
+				local um = (s0 + s1) * 0.5
+				local dc = Tk * 0.5 - f
+				emit("band", ax + ex * um + nx * dc, ay + ey * um + ny * dc, Tk, s1 - s0, math.deg(math.atan2(ny, nx)))
+				emitted = emitted + 1
+			end
+		end
+	end
+	return emitted
+end
+
+local function fillConvexPx(polyIn, pool, clip)
 	fillPool = pool
 	local opts = pool.dynamic and MOVING_FILL or STATIC_FILL
 	local poly = simplifyPoly(polyIn)
@@ -1977,93 +2358,41 @@ local function fillConvexPx(polyIn, pool)
 		for i = 1, n do r[i] = poly[n - i + 1] end
 		poly = r
 	end
-	local minX, maxX, minY, maxY = polygonBounds2D(poly)
+	local xs, ys = {}, {}
+	local minX, maxX, minY, maxY = 1e30, -1e30, 1e30, -1e30
+	for i = 1, n do
+		local p = poly[i]
+		local x, y = p.X, p.Y
+		xs[i], ys[i] = x, y
+		if x < minX then minX = x end
+		if x > maxX then maxX = x end
+		if y < minY then minY = y end
+		if y > maxY then maxY = y end
+	end
 	local w, h = maxX - minX, maxY - minY
 	if w < 2.5 and h < 2.5 then
 		local d = math.max(w, h, 1.2)
 		emit("disc", (minX + maxX) * 0.5, (minY + maxY) * 0.5, d, d, 0)
 		return 1
 	end
-	local maxDim = math.max(w, h)
-	local dx, dy, tBase, tmin = chooseAxis(poly, maxDim, opts)
-	local lp = toLocal(poly, dx, dy)
-	local ymin, ymax = math.huge, -math.huge
-	for _, p in ipairs(lp) do
-		if p.Y < ymin then ymin = p.Y end
-		if p.Y > ymax then ymax = p.Y end
+	local nxs, nys = edgeNormals(xs, ys, n)
+	if pool.soft then
+		return fillConvexSoft(xs, ys, n, nxs, nys, opts, clip)
 	end
-	local rot = math.deg(math.atan2(dy, dx))
-	local nxx, nyy = -dy, dx
-	local emitted = 0
-	-- 1) strips (inner chords)
-	stripSchedule(lp, levelsOf(lp, ymin, ymax), tBase, tmin, function(ya, yb)
-		-- width = inner chord of the strip's OWN range; only the thickness grows by the
-		-- overlap (perpendicular overshoot stays below OVERLAP/2 px).
-		local a = (ya <= ymin + 1e-6) and ya or (ya - OVERLAP * 0.5)
-		local b = (yb >= ymax - 1e-6) and yb or (yb + OVERLAP * 0.5)
-		local l0, r0 = chordAt(lp, ya, ymin, ymax)
-		local l1, r1 = chordAt(lp, yb, ymin, ymax)
-		if l0 and l1 then
-			local xl = math.max(l0, l1)
-			local xr = math.min(r0, r1)
-			if xr - xl > 0.6 then
-				local cx, cy = (xl + xr) * 0.5, (a + b) * 0.5
-				emit("rect", dx * cx + nxx * cy, dy * cx + nyy * cy, xr - xl, b - a, rot)
-				emitted = emitted + 1
-			end
-		end
-	end)
-	-- 2) bands along slanted edges
-	local normals = {}
-	for i = 1, n do
-		local a, b = poly[i], poly[i % n + 1]
-		local e = b - a
-		local len = e.Magnitude
-		if len < 1e-6 then len = 1 end
-		normals[i] = Vector2.new(-e.Y / len, e.X / len)
-	end
-	local T0 = tBase + OVERLAP + 0.6
-	for i = 1, n do
-		local a, b = poly[i], poly[i % n + 1]
-		local e = b - a
-		local len = e.Magnitude
-		if len > 3 then
-			local ex, ey = e.X / len, e.Y / len
-			local cosA = math.abs(ex * dx + ey * dy)          -- 1 = parallel to the strip axis
-			local sinA = math.sqrt(math.max(0, 1 - cosA * cosA))
-			-- flush with the strips only if the edge drifts < 0.7 px over its whole length
-			local parallel = len * sinA < 0.7
-			local perpendicular = len * cosA < 0.7
-			if not parallel and not perpendicular then
-				local mx, my = normals[i].X, normals[i].Y
-				-- Graded bands: deep first, then thinner and thinner. Thin bands fit closer
-				-- to acute tips, so together they cover them.
-				local T = T0
-				local rotE = math.deg(math.atan2(ey, ex))
-				local lastU0, lastU1 = nil, nil
-				local guard = 0
-				while T >= 1.2 and guard < 12 do
-					guard = guard + 1
-					local u0, u1 = bandInterval(poly, normals, i, ex, ey, mx, my, T)
-					if u0 and not (lastU0 and u0 >= lastU0 - 0.5 and u1 <= lastU1 + 0.5) then
-						local um = (u0 + u1) * 0.5
-						emit("rect", a.X + ex * um + mx * (T * 0.5), a.Y + ey * um + my * (T * 0.5), u1 - u0, T, rotE)
-						emitted = emitted + 1
-						lastU0, lastU1 = u0, u1
-					end
-					T = T * 0.45
-				end
-			end
-		end
-	end
-	return emitted
+	-- Moving shapes are redrawn every frame: skip the thinnest graded bands.
+	return fillConvexHard(xs, ys, n, nxs, nys, opts, clip, pool.dynamic and 2.5 or nil)
 end
 
-
+-- tile fields: centerU/V, halfU/V (the tile's own region, studs), scaleX/Y (canvas px per
+-- stud), pad (studs the canvas reaches beyond that region on every side) and ovl (studs the
+-- content reaches beyond it: neighbouring tiles overlap by a hair, so no seam can open).
 function drawConvexPolygonOnTile(polyStuds, tile, pool)
+	local pad = tile.pad or 0
+	local ovl = tile.ovl or 0
+	local hU, hV = tile.halfU + ovl, tile.halfV + ovl
 	local pMinU, pMaxU, pMinV, pMaxV = polygonBounds2D(polyStuds)
-	if pMaxU < tile.centerU - tile.halfU or pMinU > tile.centerU + tile.halfU
-		or pMaxV < tile.centerV - tile.halfV or pMinV > tile.centerV + tile.halfV then
+	if pMaxU < tile.centerU - hU or pMinU > tile.centerU + hU
+		or pMaxV < tile.centerV - hV or pMinV > tile.centerV + hV then
 		return
 	end
 	local workingPoly = ensureCCW(polyStuds)
@@ -2085,19 +2414,31 @@ function drawConvexPolygonOnTile(polyStuds, tile, pool)
 		local p = workingPoly[i]
 		localPoly[i] = Vector2.new(p.X - tile.centerU, p.Y - tile.centerV)
 	end
-	local clipped = clipPolygonToRect2D(localPoly, tile.halfU, tile.halfV)
+	-- (most shapes lie completely inside their tile: no clipping needed then)
+	local clipped = localPoly
+	local lMinU, lMaxU, lMinV, lMaxV = pMinU - tile.centerU, pMaxU - tile.centerU, pMinV - tile.centerV, pMaxV - tile.centerV
+	if tile.isCircularDisk or lMinU < -hU or lMaxU > hU or lMinV < -hV or lMaxV > hV then
+		clipped = clipPolygonToRect2D(localPoly, hU, hV)
+	end
 	local n = #clipped
 	if n < 3 then
 		return
 	end
 
-	-- Pixel space (y down).
+	-- Pixel space (y down). The canvas starts `pad` studs outside the tile's own region.
+	local sx, sy = tile.scaleX, tile.scaleY
+	local ox, oy = tile.halfU + pad, tile.halfV + pad
 	local polyPx = {}
 	for i = 1, n do
 		local p = clipped[n - i + 1]
-		polyPx[i] = Vector2.new((p.X + tile.halfU) * tile.scaleX, (-p.Y + tile.halfV) * tile.scaleY)
+		polyPx[i] = Vector2.new((p.X + ox) * sx, (-p.Y + oy) * sy)
 	end
-	fillConvexPx(polyPx, pool)
+	fillConvexPx(polyPx, pool, {
+		x0 = (pad - ovl) * sx,
+		x1 = (tile.halfU * 2 + pad + ovl) * sx,
+		y0 = (pad - ovl) * sy,
+		y1 = (tile.halfV * 2 + pad + ovl) * sy,
+	})
 end
 end
 
@@ -3491,12 +3832,52 @@ local function discoverCharacterReceivers(state, lightDir, maxRays)
 			end
 		end
 	end
-	table.sort(order, function(x, y)
-		return counts[x] > counts[y]
+	-- Keep the surface list steady: every surface keeps a decaying score, so one that a ray
+	-- happened to miss stays for a couple of refreshes and two surfaces with similar hit counts
+	-- never swap places (the exact silhouette would jump between them).
+	local score = state.planeScore
+	if not score then
+		score = {}
+		state.planeScore = score
+		state.planeMem = {}
+	end
+	local mem = state.planeMem
+	local rootNow = state.root.Position
+	if state.planeMemPos and (rootNow - state.planeMemPos).Magnitude > 8 then
+		-- teleport / respawn / elevator: nothing remembered is still relevant
+		clearTable(score)
+		clearTable(mem)
+	end
+	state.planeMemPos = rootNow
+	for key, s in pairs(score) do
+		score[key] = s * 0.55
+	end
+	for key, plane in pairs(planes) do
+		score[key] = math.min(3, (score[key] or 0) + counts[key])
+		mem[key] = plane
+	end
+	local keep = {}
+	for key, s in pairs(score) do
+		if s < 0.15 then
+			score[key] = nil
+			mem[key] = nil
+		elseif s >= 0.3 then
+			keep[#keep + 1] = key
+		end
+	end
+	local function rank(key)
+		return score[key] + (planes[key] and 1.5 or 0) -- surfaces hit right now come first
+	end
+	table.sort(keep, function(x, y)
+		local rx, ry = rank(x), rank(y)
+		if rx ~= ry then
+			return rx > ry
+		end
+		return x < y
 	end)
 	local result = {}
-	for _, key in ipairs(order) do
-		table.insert(result, planes[key])
+	for _, key in ipairs(keep) do
+		result[#result + 1] = mem[key]
 	end
 	return result, occluders
 end
@@ -3705,6 +4086,7 @@ end
 
 local usedProjectorScratch = {}
 local function renderCharacterShadow(state, lightDir, distance, allowSilhouette, isLocal)
+	setDynamicSoft(isLocal and CONFIG.DynamicSoftEdges and qualityLevel >= 0.7)
 	local baseInterval = isLocal and CONFIG.LocalReceiverInterval or CONFIG.OtherReceiverInterval
 	local interval = math.max(1, math.floor(baseInterval / qualityLevel + 0.5))
 	local recv = state.recv
@@ -4201,7 +4583,7 @@ end
 -- laxer than TargetFps.
 local perf = { avgDt = 1 / 60, bestDt = 1 / 30, limit = 1 / 45, timer = 0, frameMs = 0 }
 local function updateGovernor(dt)
-	perf.avgDt = perf.avgDt + (math.min(dt, 0.2) - perf.avgDt) * 0.05
+	perf.avgDt = perf.avgDt + (math.min(dt, 0.2) - perf.avgDt) * 0.04
 	if frameCounter > 150 then
 		if perf.avgDt < perf.bestDt then
 			perf.bestDt = perf.avgDt
@@ -4210,7 +4592,7 @@ local function updateGovernor(dt)
 		end
 	end
 	perf.timer = perf.timer + dt
-	if perf.timer < 0.5 then
+	if perf.timer < 1.0 then
 		return
 	end
 	perf.timer = 0
@@ -4221,14 +4603,18 @@ local function updateGovernor(dt)
 	end
 	local limit = math.min(math.clamp(perf.bestDt * 1.25, 1 / 90, 1 / 30), 1 / CONFIG.TargetFps)
 	perf.limit = limit
-	if perf.avgDt > limit * 1.05 then
+	-- Quality moves slowly and with a dead band: every change is a visible change in the shadows,
+	-- so it must not chase every dip (that looked like flicker).
+	if perf.avgDt > limit * 1.3 then
 		qualityLevel = math.max(CONFIG.MinQuality, qualityLevel - 0.08)
-	elseif perf.avgDt < limit * 0.9 then
-		qualityLevel = math.min(1, qualityLevel + 0.04)
+	elseif perf.avgDt > limit * 1.12 then
+		qualityLevel = math.max(CONFIG.MinQuality, qualityLevel - 0.04)
+	elseif perf.avgDt < limit * 0.85 then
+		qualityLevel = math.min(1, qualityLevel + 0.02)
 	end
-	if qualityLevel < 0.5 then
+	if qualityLevel < 0.45 then
 		lodStep = 0.6
-	elseif qualityLevel > 0.7 then
+	elseif qualityLevel > 0.75 then
 		lodStep = 1
 	end
 end
