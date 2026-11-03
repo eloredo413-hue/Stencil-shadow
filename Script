@@ -1,10 +1,10 @@
 --[[
 	============================================================================
-	ROBLOX REAL-TIME STENCIL SHADOW ENGINE (v20 - Retained Shadows, Long Range)
+	ROBLOX REAL-TIME STENCIL SHADOW ENGINE (v21 - Retained, Long Range, Stencil-Merged)
 	============================================================================
 	Client-side (LocalScript / StarterPlayerScripts / executor).
 
-	Look for "[StencilShadow v20]" in the output/F9 console when it starts. If
+	Look for "[StencilShadow v21]" in the output/F9 console when it starts. If
 	you do not see that line you are still running an older copy of the file.
 
 	WHY v20 (v19 was laggy and did not reach far):
@@ -37,7 +37,7 @@
 	Print statistics every 5 s with Debug = true.
 ]]
 
-local VERSION = "v20"
+local VERSION = "v21"
 
 -- Wall-clock seconds for intervals (os.clock() is CPU time in Roblox and is only
 -- used for the sub-millisecond per-frame budgets).
@@ -49,10 +49,8 @@ local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
 
 local VEC3_ZERO = Vector3.new(0, 0, 0)
-local VEC3_ONE = Vector3.new(1, 1, 1)
 local VEC3_X = Vector3.new(1, 0, 0)
 local VEC3_Y = Vector3.new(0, 1, 0)
-local VEC3_Z = Vector3.new(0, 0, 1)
 
 local function clearTable(t)
 	for k in pairs(t) do
@@ -94,7 +92,8 @@ local CONFIG = {
 	ShadowColor = Color3.fromRGB(0, 0, 0),  -- Silhouettes always render black, so keep this dark
 	ShadowDarkness = 0.58,                  -- 0 = invisible, 1 = pitch black
 	FadeWithSunElevation = true,            -- Shadows fade out as the sun reaches the horizon
-	MinSunElevation = 0.14,                 -- Clamp for a very low sun (keeps shadow length sane)
+	MinSunElevation = 0.32,                 -- Sun elevation is never treated as lower than this (sin of angle, 0.32 = 19 deg).
+	                                        -- A real sunset sun makes shadows 7x taller than the object and blankets the map.
 	NightShadowStrength = 0.45,             -- Moonlight shadows are softer
 
 	-- Resolution / LOD -----------------------------------------------------------
@@ -132,7 +131,11 @@ local CONFIG = {
 	MaxSilhouetteCharacters = 4,
 	MaxSilhouettePlanes = 2,                -- Surfaces per character that get an exact silhouette
 	SilhouettePixelsPerStud = 40,
-	SilhouetteFieldOfView = 1.2,            -- Near-orthographic sun camera
+	SilhouetteFieldOfView = 5,              -- Near-orthographic sun camera (degrees). Wider = closer camera, less
+	                                        -- risk of clipping, slightly less exact for tall characters.
+	LocalPlayerCore = true,                 -- Always draw a slightly shrunken real-part outline for YOUR character
+	                                        -- under the exact silhouette, so a shadow shows even if the
+	                                        -- ViewportFrame cannot render on your device.
 	LocalReceiverInterval = 3,              -- Frames between surface searches (local player)
 	OtherReceiverInterval = 6,              -- ... other characters
 	LightingTestInterval = 3,               -- Frames between sun-visibility tests per character
@@ -153,13 +156,62 @@ local CONFIG = {
 	MaxOccludersPerPlane = 4,
 	ForceDisableNativeShadows = true,       -- Disable blurry native shadows so only stencils show
 
+	-- Memory / platform --------------------------------------------------------------------
+	Preset = "Auto",                        -- "Auto" (phones/tablets without keyboard get "Mobile"), "Mobile" or "Desktop"
+	CanvasPixelBudget = 9000000,            -- Total pixels of all live tile canvases (GPU memory)
+
 	-- Performance governor -------------------------------------------------------------
 	AutoQuality = true,                     -- Sheds work automatically when FPS drops
-	TargetFps = 45,
-	MinQuality = 0.3,
-	Debug = false,                          -- Print statistics every 5 seconds
+	TargetFps = 45,                         -- Hard floor: shed work below this
+	MinQuality = 0.3,                       -- (it also reacts to a drop relative to the FPS measured before the load)
+	Debug = true,                           -- On-screen diagnostics + statistics every 5 s (set false to hide)
 	DebugSilhouette = false,                -- Draw the exact silhouettes opaque + red so you can see them
 }
+
+-- Phones and tablets without a keyboard get a lighter preset (canvases are the expensive
+-- part on a phone GPU). User overrides below always win.
+local usingMobilePreset = false
+do
+local MOBILE_PRESET = {
+	PixelsPerStud = 14,
+	MinPixelsPerStud = 2,
+	MaxCanvasPixels = 384,
+	MaxActiveCanvasSlots = 72,
+	DynamicSlotReserve = 12,
+	NearAlwaysRadius = 90,
+	MaxMapCasters = 350,
+	MaxRenderDistance = 1800,
+	ScanSlice = 700,
+	MinBakePerFrame = 1,
+	BakeChecksPerFrame = 80,
+	BakeBudgetSeconds = 0.0015,
+	TileBuildBudgetSeconds = 0.001,
+	LightRebakeAngleDeg = 1.2,
+	MaxSilhouetteCharacters = 2,
+	MaxSilhouettePlanes = 1,
+	SilhouettePixelsPerStud = 24,
+	MaxSelfShadowHighlights = 3,
+	LocalReceiverInterval = 4,
+	OtherReceiverInterval = 8,
+	CanvasPixelBudget = 3500000,
+	TargetFps = 50,
+}
+local detectedMobile = false
+pcall(function()
+	local uis = game:GetService("UserInputService")
+	detectedMobile = uis.TouchEnabled and not uis.KeyboardEnabled
+end)
+local requestedPreset = "Auto"
+if type(globalEnv.StencilShadowConfig) == "table" and type(globalEnv.StencilShadowConfig.Preset) == "string" then
+	requestedPreset = globalEnv.StencilShadowConfig.Preset
+end
+usingMobilePreset = (requestedPreset == "Mobile") or (requestedPreset == "Auto" and detectedMobile)
+if usingMobilePreset then
+	for k, v in pairs(MOBILE_PRESET) do
+		CONFIG[k] = v
+	end
+end
+end
 
 if type(globalEnv.StencilShadowConfig) == "table" then
 	for k, v in pairs(globalEnv.StencilShadowConfig) do
@@ -167,6 +219,32 @@ if type(globalEnv.StencilShadowConfig) == "table" then
 			CONFIG[k] = v
 		end
 	end
+end
+
+-- ============================================================================
+-- PART VISIBILITY (what the player can actually see)
+-- ============================================================================
+-- Games and cameras hide parts locally (roof hiding, invisicam, fade-outs) via
+-- LocalTransparencyModifier or by toggling Transparency at runtime. A part that is
+-- invisible must neither cast a shadow nor block the sun.
+local function getEffectiveTransparency(part)
+	local t = part.Transparency
+	local l = part.LocalTransparencyModifier
+	if l > 0 then
+		return 1 - (1 - t) * (1 - l)
+	end
+	return t
+end
+
+local function isPartOpaqueEnough(part)
+	local t = getEffectiveTransparency(part)
+	if t > CONFIG.MaxTransparentPartAlpha then
+		return false
+	end
+	if t > 0.05 and not part.CanCollide then
+		return false
+	end
+	return true
 end
 
 local partUidMap = setmetatable({}, { __mode = "k" })
@@ -193,7 +271,7 @@ if CONFIG.ForceDisableNativeShadows then
 	end)
 end
 
-for _, name in ipairs({ "_StencilShadowEngineV3", "_StencilShadowEngineV19", "_StencilShadowEngineV20" }) do
+for _, name in ipairs({ "_StencilShadowEngineV3", "_StencilShadowEngineV19", "_StencilShadowEngineV20", "_StencilShadowEngineV21" }) do
 	local existing = Workspace:FindFirstChild(name)
 	if existing then
 		pcall(function()
@@ -203,7 +281,7 @@ for _, name in ipairs({ "_StencilShadowEngineV3", "_StencilShadowEngineV19", "_S
 end
 
 local shadowContainer = Instance.new("Folder")
-shadowContainer.Name = "_StencilShadowEngineV20"
+shadowContainer.Name = "_StencilShadowEngineV21"
 shadowContainer.Parent = Workspace
 
 -- ============================================================================
@@ -212,8 +290,13 @@ shadowContainer.Parent = Workspace
 local currentShadowStrength = 1
 local currentGroupTransparency = 1 - CONFIG.ShadowDarkness
 local qualityLevel = 1            -- 1 = full quality, lowered by the governor
-local lodStep = 1                 -- resolution multiplier (stepped, changes rarely)
+local lodStep = 1                 -- resolution multiplier from the governor (stepped, changes rarely)
+local lodBudgetStep = 1           -- resolution multiplier that keeps total canvas memory in budget
 local frameCounter = 0
+
+local function effectiveRenderDistance()
+	return CONFIG.MaxRenderDistance * (0.35 + 0.65 * qualityLevel)
+end
 local casterStates = setmetatable({}, { __mode = "k" })
 
 -- ============================================================================
@@ -537,7 +620,7 @@ end
 local drawConvexPolygonOnTile, drawRoundShadowOnTile
 local setPrimitive, acquireRect, acquireDisc, getDynamicTile, tileRangeForBounds
 local addEntryToTiles, removeCasterContribs, processTileQueue, refreshTileStates
-local finalizeCanvasSlotsForFrame, getTileStats
+local finalizeCanvasSlotsForFrame, getTileStats, collectStaticShadowPolys
 
 -- ============================================================================
 -- RETAINED CANVAS SLOTS: every receiver tile has a STATIC layer (map shadows,
@@ -710,17 +793,28 @@ do
 		}
 	end
 
+	local totalCanvasPx = 0
+
+	-- A tile's canvas only renders while it is bound AND (probably) on screen.
+	local function syncSlotEnabled(slot)
+		local rec = slot.rec
+		local want = rec ~= nil and rec.onScreen ~= false
+		if slot.enabled ~= want then
+			slot.enabled = want
+			slot.surfaceGui.Enabled = want
+		end
+	end
+
 	local function parkSlot(slot)
 		slot.rec = nil
-		if slot.enabled then
-			slot.enabled = false
-			slot.surfaceGui.Enabled = false
-		end
+		syncSlotEnabled(slot)
 	end
 
 	local function releaseTileSlot(rec)
 		local slot = rec.slot
 		if slot then
+			totalCanvasPx = totalCanvasPx - (rec.canvasPx or 0)
+			rec.canvasPx = 0
 			parkSlot(slot)
 			rec.slot = nil
 			rec.dirty = true
@@ -816,6 +910,9 @@ do
 			wanted = false,
 			dist = math.huge,
 			lastDynFrame = -1000,
+			prio = math.huge,
+			onScreen = true,
+			canvasPx = 0,
 			lodPps = nil,
 			appliedPps = nil,
 			tile = {},
@@ -848,7 +945,7 @@ do
 			local slot = canvasSlots[i]
 			local r = slot.rec
 			if r.lastDynFrame < currentFrameId - 2 then
-				local score = r.wanted and r.dist or 1e9
+				local score = r.wanted and (r.prio or r.dist) or 1e9
 				if score > victimScore then
 					victim, victimScore = slot, score
 				end
@@ -894,7 +991,7 @@ do
 	local LOD_FACTOR = 0.62
 
 	local function chooseTilePps(rec, dist)
-		local top = CONFIG.PixelsPerStud * lodStep
+		local top = CONFIG.PixelsPerStud * math.min(lodStep, lodBudgetStep)
 		local raw = top * CONFIG.LodNearDistance / math.max(dist, CONFIG.LodNearDistance)
 		raw = math.max(raw, CONFIG.MinPixelsPerStud)
 		local cur = rec.lodPps
@@ -941,10 +1038,10 @@ do
 			slot.surfaceGui.CanvasSize = canvas
 			rec.dirty = true
 		end
-		if not slot.enabled then
-			slot.enabled = true
-			slot.surfaceGui.Enabled = true
-		end
+		local px = rawW * rawH
+		totalCanvasPx = totalCanvasPx + px - (rec.canvasPx or 0)
+		rec.canvasPx = px
+		syncSlotEnabled(slot)
 
 		local tile = rec.tile
 		tile.centerU = rec.centerU
@@ -996,7 +1093,7 @@ do
 			dirtyHead = dirtyHead + 1
 			rec.queued = false
 			if rec.wanted and (rec.dirty or not rec.slot or rec.appliedPps == nil) then
-				local slot = ensureTileBound(rec, rec.dist)
+				local slot = ensureTileBound(rec, rec.prio or rec.dist)
 				if slot then
 					prepareBoundTile(rec)
 				end
@@ -1021,9 +1118,29 @@ do
 	local TILE_SCAN_SLICE = 400
 
 	local function finishTileRefresh()
-		local maxStatic = CONFIG.MaxActiveCanvasSlots - CONFIG.DynamicSlotReserve
+		local maxStatic = math.floor((CONFIG.MaxActiveCanvasSlots - CONFIG.DynamicSlotReserve) * (0.4 + 0.6 * qualityLevel))
+		-- Keep the total canvas memory inside its budget by lowering resolution a step at a time.
+		local budget = CONFIG.CanvasPixelBudget * (0.4 + 0.6 * qualityLevel)
+		if totalCanvasPx > budget * 1.05 then
+			lodBudgetStep = math.max(0.3, lodBudgetStep * 0.88)
+		elseif totalCanvasPx < budget * 0.6 and lodBudgetStep < 1 then
+			lodBudgetStep = math.min(1, lodBudgetStep * 1.06)
+		end
+		-- Importance ~ apparent size: how much shadow a tile holds versus how far away it is.
+		-- A big far shadow then beats a tiny near one when slots are scarce.
+		for i = 1, #wantedScratch do
+			local rec = wantedScratch[i]
+			local area = 0
+			for _, list in pairs(rec.contrib) do
+				for j = 1, #list do
+					area = area + (list[j].area or 0)
+				end
+			end
+			local tileArea = rec.halfU * rec.halfV * 4
+			rec.prio = (rec.dist + 20) / math.sqrt(math.max(math.min(area, tileArea), 4))
+		end
 		table.sort(wantedScratch, function(a, b)
-			return a.dist < b.dist
+			return a.prio < b.prio
 		end)
 		for i = maxStatic + 1, #wantedScratch do
 			wantedScratch[i].wanted = false
@@ -1068,10 +1185,24 @@ do
 				local d = math.max(0, (rec.origin - camPos).Magnitude - rec.radius * 0.7)
 				rec.dist = d
 				local wanted = false
-				if rec.nContrib > 0 and d <= CONFIG.MaxRenderDistance then
+				if rec.nContrib > 0 and d <= effectiveRenderDistance() then
 					wanted = d < CONFIG.NearAlwaysRadius or isSphereOnScreen(rec.origin, rec.radius * 1.15)
+					-- Shadows must not float on a surface the player can no longer see.
+					if wanted then
+						local rp = rec.plane.part
+						if rp and not rec.plane.isTerrain and not isPartOpaqueEnough(rp) then
+							wanted = false
+						end
+					end
 				end
 				rec.wanted = wanted
+				if rec.slot then
+					local on = (currentFrameId - rec.lastDynFrame) < 20 or isSphereOnScreen(rec.origin, rec.radius * 1.3)
+					if rec.onScreen ~= on then
+						rec.onScreen = on
+						syncSlotEnabled(rec.slot)
+					end
+				end
 				if wanted then
 					wantedScratch[#wantedScratch + 1] = rec
 				elseif rec.nContrib == 0 and not rec.slot and (currentFrameId - rec.lastDynFrame) > 900 then
@@ -1179,6 +1310,16 @@ do
 
 	function addEntryToTiles(state, entry)
 		local plane, ops = entry.plane, entry.ops
+		if not entry.area then
+			local area = 0
+			for _, poly in ipairs(ops.polys) do
+				area = area + math.abs(polygonSignedArea(poly))
+			end
+			for _, r in ipairs(ops.rounds) do
+				area = area + math.abs(polygonSignedArea(r.outline))
+			end
+			entry.area = area
+		end
 		-- Only tiles the shape really touches (not just its bounding box).
 		local function visit(shape)
 			local minU, maxU, minV, maxV = polygonBounds2D(shape)
@@ -1206,6 +1347,52 @@ do
 		end
 		for _, r in ipairs(ops.rounds) do
 			visit(r.outline)
+		end
+	end
+
+	-- Shadow polygons already baked on `plane` that overlap the given plane-space rect.
+	-- These are exactly the shapes the static layer paints, so a moving shadow can be
+	-- merged with them (stencil semantics: never darken twice, never leave a gap).
+	function collectStaticShadowPolys(plane, minU, maxU, minV, maxV, out, seen)
+		local tx0, tx1, ty0, ty1 = tileRangeForBounds(plane, minU, maxU, minV, maxV)
+		if not tx0 then
+			return
+		end
+		for tx = tx0, tx1 do
+			for ty = ty0, ty1 do
+				local key = plane.baseKey
+				if plane.isTiled then
+					key = key .. "_" .. tostring(tx) .. "_" .. tostring(ty)
+				end
+				local rec = tileRecs[key]
+				if rec then
+					for _, list in pairs(rec.contrib) do
+						for i = 1, #list do
+							local ops = list[i].ops
+							for p = 1, #ops.polys do
+								local poly = ops.polys[p]
+								if not seen[poly] then
+									local a, b, c, d = polygonBounds2D(poly)
+									if b >= minU and a <= maxU and d >= minV and c <= maxV then
+										seen[poly] = true
+										out[#out + 1] = poly
+									end
+								end
+							end
+							for r = 1, #ops.rounds do
+								local poly = ops.rounds[r].outline
+								if poly and not seen[poly] then
+									local a, b, c, d = polygonBounds2D(poly)
+									if b >= minU and a <= maxU and d >= minV and c <= maxV then
+										seen[poly] = true
+										out[#out + 1] = poly
+									end
+								end
+							end
+						end
+					end
+				end
+			end
 		end
 	end
 
@@ -1237,13 +1424,6 @@ end
 -- ============================================================================
 -- RECEIVER PLANE EXTRACTION (BaseParts, cylinders, wedges & Terrain)
 -- ============================================================================
-local function isPartOpaqueEnough(part)
-	if not part.CanCollide and part.Transparency > 0.05 then
-		return false
-	end
-	return part.Transparency <= CONFIG.MaxTransparentPartAlpha
-end
-
 local function getCylinderAxisAndRadius(part)
 	local cf = part.CFrame
 	local size = part.Size
@@ -1512,55 +1692,317 @@ function drawRoundShadowOnTile(r, tile, pool)
 	end
 end
 
--- Widest band [uLeft, uRight] along an edge axis that stays inside the polygon.
-local function getSafeBandInterval(polyPx, ox, oy, tx, ty, nx, ny, y0, y1)
-	local uLeft = -math.huge
-	local uRight = math.huge
-	local count = #polyPx
-	local prev = polyPx[count]
-	local px, py = prev.X - ox, prev.Y - oy
-	local xPrev = px * tx + py * ty
-	local yPrev = px * nx + py * ny
+-- ============================================================================
+-- CONVEX POLYGON FILL (pixel space)
+-- ============================================================================
+-- A GUI Frame can only be a rectangle, so a polygon is built from rotated rectangles:
+--   * STRIPS along the best axis, measured with INNER chords (they never poke outside).
+--   * graded BANDS along every slanted edge: the exact edge, they also close the gaps the
+--     strips leave beside slanted sides and reach into sharp tips.
+--   * every internal boundary overlaps by a pixel or two, so rotated edges never leave seams.
+-- Measured on 1,100 random shadow-like polygons (offline coverage test): about 20 primitives
+-- (the old method used ~36), the largest hole ~50 px^2 (was ~1,800 px^2) and no overshoot.
+do
+local diskClipCache = {}
 
-	for i = 1, count do
-		local curr = polyPx[i]
-		local cx, cy = curr.X - ox, curr.Y - oy
-		local xCurr = cx * tx + cy * ty
-		local yCurr = cx * nx + cy * ny
-		local dy = yCurr - yPrev
-		local dx = xCurr - xPrev
+local OVERLAP = 1.6
+local fillPool = nil
 
-		if math.abs(dy) < 1e-5 then
-			if math.abs(dx) > 1e-5 then
-				if dx > 0 then
-					if yPrev > math.min(y0, y1) + 1e-3 then
-						return false, 0, 0
-					end
-				elseif yPrev < math.max(y0, y1) - 1e-3 then
-					return false, 0, 0
-				end
-			end
-		elseif dy < 0 then
-			local b0 = xPrev + (y0 - yPrev) * (dx / dy)
-			local b1 = xPrev + (y1 - yPrev) * (dx / dy)
-			local reqLeft = math.max(b0, b1)
-			if reqLeft > uLeft then uLeft = reqLeft end
-		else
-			local b0 = xPrev + (y0 - yPrev) * (dx / dy)
-			local b1 = xPrev + (y1 - yPrev) * (dx / dy)
-			local reqRight = math.min(b0, b1)
-			if reqRight < uRight then uRight = reqRight end
-		end
-		xPrev, yPrev = xCurr, yCurr
+local function emit(kind, cx, cy, w, h, rot)
+	if kind == "disc" then
+		setPrimitive(acquireDisc(fillPool), cx, cy, w, h, 0)
+	else
+		setPrimitive(acquireRect(fillPool), cx, cy, w, h, rot)
 	end
-
-	if uRight <= uLeft + 0.15 then
-		return false, 0, 0
-	end
-	return true, uLeft, uRight
 end
 
-local diskClipCache = {}
+local function simplifyPoly(poly)
+	local out = {}
+	local n = #poly
+	for i = 1, n do
+		local p = poly[i]
+		local q = out[#out]
+		if not q or (p - q).Magnitude > 0.25 then
+			out[#out + 1] = p
+		end
+	end
+	if #out > 1 and (out[1] - out[#out]).Magnitude <= 0.25 then
+		out[#out] = nil
+	end
+	-- drop (nearly) collinear vertices
+	local changed = true
+	while changed and #out > 3 do
+		changed = false
+		for i = 1, #out do
+			local a = out[(i - 2) % #out + 1]
+			local b = out[i]
+			local c = out[i % #out + 1]
+			local cr = (b.X - a.X) * (c.Y - b.Y) - (b.Y - a.Y) * (c.X - b.X)
+			local len = (c - a).Magnitude
+			if len > 0 and math.abs(cr) / len < 0.12 then
+				table.remove(out, i)
+				changed = true
+				break
+			end
+		end
+	end
+	return out
+end
+
+local function toLocal(poly, dx, dy)
+	-- rotation into the axis frame: x' = p.d , y' = p.n  with n = (-dy, dx)
+	local out = {}
+	for i = 1, #poly do
+		local p = poly[i]
+		out[i] = Vector2.new(p.X * dx + p.Y * dy, -p.X * dy + p.Y * dx)
+	end
+	return out
+end
+
+-- Chord of the polygon at height y (nil outside). Heights are clamped half a pixel inside
+-- the polygon so an edge that is parallel to the strips up to a tiny tilt still has a
+-- usable chord at the extreme level.
+local function chordAt(lp, y, ymin, ymax)
+	if ymin then
+		y = math.max(ymin + 0.5, math.min(ymax - 0.5, y))
+	end
+	local xl, xr = convexChordAtY(lp, y)
+	if not xl then
+		return nil, nil
+	end
+	return xl, xr
+end
+
+-- Vertex levels of the polygon in the axis frame (strips follow them, so every piece
+-- between two levels has exactly straight sides).
+local function levelsOf(lp, ymin, ymax)
+	local ys = {}
+	for i = 1, #lp do ys[i] = lp[i].Y end
+	table.sort(ys)
+	local out = { ymin }
+	for i = 1, #ys do
+		local y = ys[i]
+		if y > out[#out] + 0.6 and y < ymax - 0.6 then
+			out[#out + 1] = y
+		end
+	end
+	out[#out + 1] = ymax
+	return out
+end
+
+-- Strip schedule shared by counting and emitting. visit(y0, y1) per strip.
+local function stripSchedule(lp, levels, tBase, tmin, visit)
+	local count = 0
+	for k = 1, #levels - 1 do
+		local ya, yb = levels[k], levels[k + 1]
+		local l0, r0 = chordAt(lp, ya, levels[1], levels[#levels])
+		local l1, r1 = chordAt(lp, yb, levels[1], levels[#levels])
+		if l0 and l1 then
+			if math.abs(l1 - l0) < 0.15 and math.abs(r1 - r0) < 0.15 then
+				-- both sides parallel to the axis: a single strip
+				count = count + 1
+				if visit then visit(ya, yb) end
+			else
+				local len = yb - ya
+				-- A strip loses at most (slope * thickness) of width at its slanted ends. Where
+				-- the sides are almost parallel to the strip direction (slope ~ 0) strips can
+				-- be thick; steep sides get thin strips and the edge bands finish the job.
+				local slope = math.max(math.abs(l1 - l0), math.abs(r1 - r0)) / len
+				local tAllow = math.min(math.max(tBase, 1.2 / math.max(slope, 1e-6)), 48)
+				local n = math.min(400, math.max(1, math.ceil(len / tAllow - 1e-6)))
+				local t = len / n
+				if t < tmin and n > 1 then
+					n = math.max(1, math.floor(len / tmin))
+					t = len / n
+				end
+				for j = 0, n - 1 do
+					count = count + 1
+					if visit then visit(ya + j * t, (j == n - 1) and yb or (ya + (j + 1) * t)) end
+				end
+			end
+		end
+	end
+	return count
+end
+
+-- Chooses the strip axis and the strip thickness. The thickness must stay below the
+-- polygon's own minimum width (otherwise the inner chord vanishes on thin slivers).
+local function chooseAxis(poly, maxDim, opts)
+	local candidates = { { 1, 0 }, { 0, 1 } }
+	local n = #poly
+	-- axes of the three longest edges
+	local top = {}
+	for i = 1, n do
+		local a, b = poly[i], poly[i % n + 1]
+		local e = b - a
+		local len = e.Magnitude
+		if len > 3 then
+			top[#top + 1] = { len, e.X / len, e.Y / len }
+		end
+	end
+	table.sort(top, function(p, q)
+		return p[1] > q[1]
+	end)
+	for i = 1, math.min(3, #top) do
+		candidates[#candidates + 1] = { top[i][2], top[i][3] }
+	end
+	local minWidth = math.huge
+	for _, c in ipairs(candidates) do
+		local lp = toLocal(poly, c[1], c[2])
+		local ymin, ymax = math.huge, -math.huge
+		for _, p in ipairs(lp) do
+			if p.Y < ymin then ymin = p.Y end
+			if p.Y > ymax then ymax = p.Y end
+		end
+		c.lp, c.ymin, c.ymax = lp, ymin, ymax
+		local ext = ymax - ymin
+		if ext < minWidth then minWidth = ext end
+	end
+	local tCap = opts.tCap or math.clamp((opts.capFrac or 0.03) * maxDim, 3, opts.capMax or 12)
+	local tBase = math.clamp(0.45 * minWidth, 0.9, tCap)
+	local tmin = math.min(opts.tmin or 1.5, tBase * 0.6)
+	local best, bestCost = nil, math.huge
+	for _, c in ipairs(candidates) do
+		local cost = stripSchedule(c.lp, levelsOf(c.lp, c.ymin, c.ymax), tBase, tmin, nil)
+		if cost < bestCost then
+			best, bestCost = c, cost
+		end
+	end
+	return best[1], best[2], tBase, tmin
+end
+
+-- inner-safe interval [u0,u1] along edge i for a band of depth T
+local function bandInterval(poly, normals, i, ex, ey, mx, my, T)
+	local n = #poly
+	local A = poly[i]
+	local L = (poly[i % n + 1] - A).Magnitude
+	local lo, hi = 0, L
+	for j = 1, n do
+		if j ~= i then
+			local nx, ny = normals[j].X, normals[j].Y
+			local Aj = poly[j]
+			local c = nx * Aj.X + ny * Aj.Y
+			local a = nx * ex + ny * ey
+			for _, v in ipairs({ 0, T }) do
+				local b = nx * A.X + ny * A.Y + (nx * mx + ny * my) * v - c
+				if math.abs(a) < 1e-9 then
+					if b < -0.05 then
+						return nil
+					end
+				elseif a > 0 then
+					lo = math.max(lo, (-0.05 - b) / a)
+				else
+					hi = math.min(hi, (-0.05 - b) / a)
+				end
+			end
+		end
+	end
+	if hi - lo < 1.0 then
+		return nil
+	end
+	return lo, hi
+end
+
+-- Moving shapes (characters) are redrawn every frame, so they use a slightly coarser fill.
+local STATIC_FILL = {}
+local MOVING_FILL = { capFrac = 0.08, capMax = 14 }
+
+local function fillConvexPx(polyIn, pool)
+	fillPool = pool
+	local opts = pool.dynamic and MOVING_FILL or STATIC_FILL
+	local poly = simplifyPoly(polyIn)
+	local n = #poly
+	if n < 3 then
+		return 0
+	end
+	if polygonSignedArea(poly) < 0 then
+		local r = {}
+		for i = 1, n do r[i] = poly[n - i + 1] end
+		poly = r
+	end
+	local minX, maxX, minY, maxY = polygonBounds2D(poly)
+	local w, h = maxX - minX, maxY - minY
+	if w < 2.5 and h < 2.5 then
+		local d = math.max(w, h, 1.2)
+		emit("disc", (minX + maxX) * 0.5, (minY + maxY) * 0.5, d, d, 0)
+		return 1
+	end
+	local maxDim = math.max(w, h)
+	local dx, dy, tBase, tmin = chooseAxis(poly, maxDim, opts)
+	local lp = toLocal(poly, dx, dy)
+	local ymin, ymax = math.huge, -math.huge
+	for _, p in ipairs(lp) do
+		if p.Y < ymin then ymin = p.Y end
+		if p.Y > ymax then ymax = p.Y end
+	end
+	local rot = math.deg(math.atan2(dy, dx))
+	local nxx, nyy = -dy, dx
+	local emitted = 0
+	-- 1) strips (inner chords)
+	stripSchedule(lp, levelsOf(lp, ymin, ymax), tBase, tmin, function(ya, yb)
+		-- width = inner chord of the strip's OWN range; only the thickness grows by the
+		-- overlap (perpendicular overshoot stays below OVERLAP/2 px).
+		local a = (ya <= ymin + 1e-6) and ya or (ya - OVERLAP * 0.5)
+		local b = (yb >= ymax - 1e-6) and yb or (yb + OVERLAP * 0.5)
+		local l0, r0 = chordAt(lp, ya, ymin, ymax)
+		local l1, r1 = chordAt(lp, yb, ymin, ymax)
+		if l0 and l1 then
+			local xl = math.max(l0, l1)
+			local xr = math.min(r0, r1)
+			if xr - xl > 0.6 then
+				local cx, cy = (xl + xr) * 0.5, (a + b) * 0.5
+				emit("rect", dx * cx + nxx * cy, dy * cx + nyy * cy, xr - xl, b - a, rot)
+				emitted = emitted + 1
+			end
+		end
+	end)
+	-- 2) bands along slanted edges
+	local normals = {}
+	for i = 1, n do
+		local a, b = poly[i], poly[i % n + 1]
+		local e = b - a
+		local len = e.Magnitude
+		if len < 1e-6 then len = 1 end
+		normals[i] = Vector2.new(-e.Y / len, e.X / len)
+	end
+	local T0 = tBase + OVERLAP + 0.6
+	for i = 1, n do
+		local a, b = poly[i], poly[i % n + 1]
+		local e = b - a
+		local len = e.Magnitude
+		if len > 3 then
+			local ex, ey = e.X / len, e.Y / len
+			local cosA = math.abs(ex * dx + ey * dy)          -- 1 = parallel to the strip axis
+			local sinA = math.sqrt(math.max(0, 1 - cosA * cosA))
+			-- flush with the strips only if the edge drifts < 0.7 px over its whole length
+			local parallel = len * sinA < 0.7
+			local perpendicular = len * cosA < 0.7
+			if not parallel and not perpendicular then
+				local mx, my = normals[i].X, normals[i].Y
+				-- Graded bands: deep first, then thinner and thinner. Thin bands fit closer
+				-- to acute tips, so together they cover them.
+				local T = T0
+				local rotE = math.deg(math.atan2(ey, ex))
+				local lastU0, lastU1 = nil, nil
+				local guard = 0
+				while T >= 1.2 and guard < 12 do
+					guard = guard + 1
+					local u0, u1 = bandInterval(poly, normals, i, ex, ey, mx, my, T)
+					if u0 and not (lastU0 and u0 >= lastU0 - 0.5 and u1 <= lastU1 + 0.5) then
+						local um = (u0 + u1) * 0.5
+						emit("rect", a.X + ex * um + mx * (T * 0.5), a.Y + ey * um + my * (T * 0.5), u1 - u0, T, rotE)
+						emitted = emitted + 1
+						lastU0, lastU1 = u0, u1
+					end
+					T = T * 0.45
+				end
+			end
+		end
+	end
+	return emitted
+end
+
+
 function drawConvexPolygonOnTile(polyStuds, tile, pool)
 	local pMinU, pMaxU, pMinV, pMaxV = polygonBounds2D(polyStuds)
 	if pMaxU < tile.centerU - tile.halfU or pMinU > tile.centerU + tile.halfU
@@ -1592,138 +2034,16 @@ function drawConvexPolygonOnTile(polyStuds, tile, pool)
 		return
 	end
 
-	-- Pixel space (y down). Reverse order so the polygon stays counter-clockwise.
+	-- Pixel space (y down).
 	local polyPx = {}
 	for i = 1, n do
 		local p = clipped[n - i + 1]
 		polyPx[i] = Vector2.new((p.X + tile.halfU) * tile.scaleX, (-p.Y + tile.halfV) * tile.scaleY)
 	end
-
-	local minX, maxX, minY, maxY = polygonBounds2D(polyPx)
-	if (maxX - minX) < 2.5 and (maxY - minY) < 2.5 then
-		local d = math.max(maxX - minX, maxY - minY, 1.2)
-		setPrimitive(acquireDisc(pool), (minX + maxX) * 0.5, (minY + maxY) * 0.5, d, d, 0)
-		return
-	end
-
-	local highDetail = tile.pps >= 15 and not pool.dynamic
-	local bestEdgeLen = -1
-	local bestTx, bestTy = 1, 0
-	local thinnest = math.huge
-
-	for i = 1, n do
-		local a = polyPx[i]
-		local b = polyPx[(i % n) + 1]
-		local dx = b.X - a.X
-		local dy = b.Y - a.Y
-		local len = math.sqrt(dx * dx + dy * dy)
-		if len > 0.5 then
-			local tx, ty = dx / len, dy / len
-			local nx, ny = -ty, tx
-			if len > bestEdgeLen then
-				bestEdgeLen = len
-				bestTx, bestTy = tx, ty
-			end
-
-			local depthMax = 0
-			for j = 1, n do
-				local vy = (polyPx[j].X - a.X) * nx + (polyPx[j].Y - a.Y) * ny
-				if vy > depthMax then
-					depthMax = vy
-				end
-			end
-			if depthMax < thinnest then
-				thinnest = depthMax
-			end
-
-			local rotDeg = math.deg(math.atan2(ty, tx))
-			local d1 = math.clamp(depthMax * 0.07, 0.9, 6.0)
-			local d2 = math.clamp(depthMax * 0.22, 2.0, 20.0)
-			local d3 = math.clamp(depthMax * 0.48, 3.0, 64.0)
-			local depths = highDetail and { d1, d2, d3 } or { d2, d3 }
-			for dIdx = 1, #depths do
-				local d = depths[dIdx]
-				if d <= depthMax - 0.1 then
-					local ok, uLeft, uRight = getSafeBandInterval(polyPx, a.X, a.Y, tx, ty, nx, ny, 0, d)
-					if ok then
-						local uMid = 0.5 * (uLeft + uRight)
-						local vMid = 0.5 * d
-						setPrimitive(acquireRect(pool),
-							a.X + tx * uMid + nx * vMid,
-							a.Y + ty * uMid + ny * vMid,
-							uRight - uLeft, d + 0.4, rotDeg)
-					end
-				end
-			end
-		end
-	end
-
-	-- Interior strips along the dominant edge and its perpendicular.
-	if bestEdgeLen > 1.5 then
-		for aIdx = 1, 2 do
-			local tx, ty, nx, ny
-			if aIdx == 1 then
-				tx, ty, nx, ny = bestTx, bestTy, -bestTy, bestTx
-			else
-				tx, ty, nx, ny = -bestTy, bestTx, -bestTx, -bestTy
-			end
-			local rotDeg = math.deg(math.atan2(ty, tx))
-			local vMin, vMax = math.huge, -math.huge
-			for i = 1, n do
-				local v = polyPx[i].X * nx + polyPx[i].Y * ny
-				if v < vMin then vMin = v end
-				if v > vMax then vMax = v end
-			end
-			local spanV = vMax - vMin
-			if spanV > 2.0 then
-				local numStrips = (aIdx == 1) and 4 or 3
-				local dv = spanV / numStrips
-				for k = 0, numStrips - 1 do
-					local v0 = vMin + (k * 0.88 + 0.06) * dv
-					local v1 = vMin + ((k + 1) * 0.88 + 0.06) * dv
-					local ok, uLeft, uRight = getSafeBandInterval(polyPx, 0, 0, tx, ty, nx, ny, v0, v1)
-					if ok then
-						local uMid = 0.5 * (uLeft + uRight)
-						local vMid = 0.5 * (v0 + v1)
-						setPrimitive(acquireRect(pool), tx * uMid + nx * vMid, ty * uMid + ny * vMid,
-							uRight - uLeft, (v1 - v0) + 0.4, rotDeg)
-					end
-				end
-			end
-		end
-	end
-
-	-- Rounded corner fillers: a disc tangent to both edges near each vertex
-	-- fills the wedge the edge bands cannot reach.
-	if highDetail and thinnest > 3 then
-		for i = 1, n do
-			local prev = polyPx[((i - 2) % n) + 1]
-			local v = polyPx[i]
-			local nxt = polyPx[(i % n) + 1]
-			local e1 = prev - v
-			local e2 = nxt - v
-			local l1, l2 = e1.Magnitude, e2.Magnitude
-			if l1 > 1 and l2 > 1 then
-				local u1, u2 = e1 / l1, e2 / l2
-				local cosPhi = math.clamp(u1:Dot(u2), -1, 1)
-				local phi = math.acos(cosPhi)
-				if phi > 0.12 and phi < math.pi - 0.08 then
-					local bis = u1 + u2
-					local bl = bis.Magnitude
-					if bl > 1e-4 then
-						local halfSin = math.sin(phi * 0.5)
-						local r = math.min(math.clamp(thinnest * 0.07, 0.9, 6.0) * 1.15,
-							0.45 * math.min(l1, l2) * math.tan(phi * 0.5))
-						if r > 0.6 then
-							local c = v + (bis / bl) * (r / halfSin)
-							setPrimitive(acquireDisc(pool), c.X, c.Y, r * 2, r * 2, 0)
-						end
-					end
-				end
-			end
-		end
-	end
+	fillConvexPx(polyPx, pool)
 end
+end
+
 
 -- ============================================================================
 -- CASTER HULLS (map parts)
@@ -2061,8 +2381,16 @@ end
 
 -- Receiver area that is NOT already shadowed by the given occluders.
 -- Returns a list of disjoint convex pieces and whether it is the untouched receiver.
-local function computeVisiblePieces(plane, occluders, lightDir)
+local function computeVisiblePieces(plane, occluders, lightDir, region)
 	local receiverPoly = getReceiverPolygon2D(plane)
+	if region then
+		-- Only the area that matters (a moving character's footprint): keeps the piece
+		-- list small even on a huge floor.
+		receiverPoly = clipPolygonToBox2D(receiverPoly, region.minU, region.maxU, region.minV, region.maxV)
+		if #receiverPoly < 3 then
+			return {}, true
+		end
+	end
 	local pieces = { receiverPoly }
 	local untouched = true
 	if not occluders then
@@ -2165,17 +2493,28 @@ end
 -- ============================================================================
 local characterModels = {}
 local globalRaycastIgnoreList = { shadowContainer }
-local casterList = {}        -- array of candidate map parts (swap-remove)
-local casterIndex = {}       -- part -> index in casterList
+-- Candidate map parts as parallel arrays (swap-remove). Position / size are cached so
+-- scanning tens of thousands of parts costs table reads, not property reads.
+local casterList = {}
+local casterPos = {}         -- cached position (read live for unanchored parts)
+local casterMag = {}         -- cached Size.Magnitude
+local casterDyn = {}         -- true when the part is unanchored
+local casterIndex = {}       -- part -> index
+local casterVersion = 0      -- bumps whenever the set changes
 local ignoreListDirty = true
 local characterProfileDirty = setmetatable({}, { __mode = "k" })
 
-local function addCaster(part)
-	if not casterIndex[part] then
-		local n = #casterList + 1
-		casterList[n] = part
-		casterIndex[part] = n
+local function addCaster(part, pos, mag, dyn)
+	local idx = casterIndex[part]
+	if not idx then
+		idx = #casterList + 1
+		casterList[idx] = part
+		casterIndex[part] = idx
+		casterVersion = casterVersion + 1
 	end
+	casterPos[idx] = pos
+	casterMag[idx] = mag
+	casterDyn[idx] = dyn
 end
 
 local function removeCaster(part)
@@ -2184,9 +2523,16 @@ local function removeCaster(part)
 		local last = #casterList
 		local lastPart = casterList[last]
 		casterList[idx] = lastPart
+		casterPos[idx] = casterPos[last]
+		casterMag[idx] = casterMag[last]
+		casterDyn[idx] = casterDyn[last]
 		casterIndex[lastPart] = idx
 		casterList[last] = nil
+		casterPos[last] = nil
+		casterMag[last] = nil
+		casterDyn[last] = nil
 		casterIndex[part] = nil
+		casterVersion = casterVersion + 1
 	end
 end
 
@@ -2221,10 +2567,6 @@ local function evaluateMapPartState(part)
 	if (terrain and part == terrain) or part:IsDescendantOf(shadowContainer) then
 		return
 	end
-	if not isPartOpaqueEnough(part) then
-		removeCaster(part)
-		return
-	end
 	local s = part.Size
 	if (s.X > CONFIG.MaxCasterPartSize or s.Z > CONFIG.MaxCasterPartSize) and s.Y < 15 then
 		removeCaster(part)
@@ -2234,7 +2576,9 @@ local function evaluateMapPartState(part)
 		removeCaster(part)
 		return
 	end
-	addCaster(part)
+	-- Visibility (transparency, LocalTransparencyModifier) changes at runtime, so it is
+	-- NOT decided here; the caster scan and the bake step check it live.
+	addCaster(part, part.Position, s.Magnitude, not part.Anchored)
 end
 
 local function markCharacter(model)
@@ -2346,35 +2690,17 @@ local function isRayPassable(inst)
 	return inst ~= terrain and inst:IsA("BasePart") and not isPartOpaqueEnough(inst)
 end
 
--- True when something opaque stands between `origin` and the sun.
-local function isSunBlocked(origin, vec)
-	local remaining = vec.Magnitude
-	local dir = vec / remaining
-	local o = origin
-	for _ = 1, 4 do
-		local hit = Workspace:Raycast(o, dir * remaining, rayParams)
-		if not hit then
-			return false
+local lastErrorText = "-"
+local reportError
+do
+	local reportedErrors = {}
+	function reportError(tag, err)
+		local msg = tag .. ": " .. tostring(err)
+		lastErrorText = msg
+		if not reportedErrors[msg] then
+			reportedErrors[msg] = true
+			warn("[StencilShadow " .. VERSION .. "] " .. msg)
 		end
-		if not isRayPassable(hit.Instance) then
-			return true
-		end
-		local step = (hit.Position - o).Magnitude + 0.15
-		remaining = remaining - step
-		if remaining <= 0.5 then
-			return false
-		end
-		o = o + dir * step
-	end
-	return false
-end
-
-local reportedErrors = {}
-local function reportError(tag, err)
-	local msg = tag .. ": " .. tostring(err)
-	if not reportedErrors[msg] then
-		reportedErrors[msg] = true
-		warn("[StencilShadow " .. VERSION .. "] " .. msg)
 	end
 end
 
@@ -2399,6 +2725,10 @@ local function rebuildCharacterParts(state, model)
 				desc.CastShadow = false
 			end
 			local info = state.partInfo[desc] or { part = desc, lit = 1, target = 1 }
+			if info.isAcc == nil then
+				info.isAcc = (desc:FindFirstAncestorWhichIsA("Accessory") ~= nil)
+					or (desc:FindFirstAncestorWhichIsA("Tool") ~= nil)
+			end
 			table.insert(state.parts, info)
 		end
 	end
@@ -2428,8 +2758,8 @@ local function getCharacterState(model)
 			recvFrame = -1000,
 			recvPos = VEC3_ZERO,
 			recvLight = VEC3_ZERO,
-			lightTick = 0,
-			lightInit = false,
+			floorTarget = 1,
+			diag = {},
 		}
 		charStates[model] = state
 		characterProfileDirty[model] = true
@@ -2445,40 +2775,17 @@ local function isPartVisibleForShadow(part)
 	return part.Parent ~= nil and part.Transparency < 0.98
 end
 
--- Sun visibility per visible part. The rays run every few frames; only the cheap
--- smoothing runs every frame, so a part fades in/out of shade without popping.
-local function updateCharacterLighting(state, sunDir, dt, detailed)
+-- Shading follows what the floor shows. refreshCharacterReceivers() decides whether the
+-- spot a character stands on lies inside an already-baked shadow (state.floorTarget:
+-- 0 = shaded, 1 = lit). Here we only smooth the change, so a part fades in and out of
+-- shade without popping. (No per-part sun rays: cheaper, and never disagrees with the
+-- shadows the player can see.)
+local function updateCharacterLighting(state, dt)
 	local alpha = 1 - math.exp(-CONFIG.SelfShadowFadeSpeed * dt)
-	local runRays = false
-	state.lightTick = state.lightTick + 1
-	local interval = math.max(1, math.floor(CONFIG.LightingTestInterval / qualityLevel + 0.5))
-	if not detailed then
-		interval = interval * 2
-	end
-	if state.lightTick >= interval or not state.lightInit then
-		-- Start the next countdown at 1 so these rays fall on a different frame
-		-- than the receiver search (which runs on the same interval).
-		state.lightTick = 1
-		state.lightInit = true
-		runRays = true
-	end
-	local rayVec = sunDir * 600
-	local rootTarget = nil
-	if runRays and not detailed then
-		rootTarget = isSunBlocked(state.root.Position, rayVec) and 0 or 1
-	end
+	local target = state.floorTarget
 	for _, info in ipairs(state.parts) do
-		if runRays then
-			local part = info.part
-			if isPartVisibleForShadow(part) then
-				local target = rootTarget
-				if target == nil then
-					target = isSunBlocked(part.Position, rayVec) and 0 or 1
-				end
-				info.target = target
-			end
-		end
-		local diff = info.target - info.lit
+		info.target = target
+		local diff = target - info.lit
 		if diff > 0.002 or diff < -0.002 then
 			info.lit = info.lit + diff * alpha
 		end
@@ -2644,8 +2951,21 @@ local function createProjector()
 	sgui.Adornee = part
 	sgui.Parent = part
 
+	if CONFIG.DebugSilhouette then
+		-- Shows WHERE the silhouette is placed even if the 3D content fails to render.
+		local back = Instance.new("Frame")
+		back.Name = "DebugBack"
+		back.BackgroundColor3 = Color3.fromRGB(255, 0, 255)
+		back.BackgroundTransparency = 0.55
+		back.BorderSizePixel = 0
+		back.Size = UDim2.new(1, 0, 1, 0)
+		back.ZIndex = 0
+		back.Parent = sgui
+	end
+
 	local vpf = Instance.new("ViewportFrame")
 	vpf.Name = "Silhouette"
+	vpf.ZIndex = 2
 	vpf.BackgroundTransparency = 1
 	vpf.BorderSizePixel = 0
 	vpf.AnchorPoint = Vector2.new(0, 0)
@@ -2935,17 +3255,18 @@ local function getInfoBox(info)
 	return off, info.vbSize
 end
 
-local function partApproxHull(info)
+local function partApproxHull(info, scale)
 	local part = info.part
 	local off, size = getInfoBox(info)
 	local cf = part.CFrame
 	if off.X ~= 0 or off.Y ~= 0 or off.Z ~= 0 then
 		cf = cf * CFrame.new(off)
 	end
+	scale = scale or 1
 	if part.Name == "Head" then
-		return makeEllipsoidHull(part, cf, size * 0.5)
+		return makeEllipsoidHull(part, cf, size * (0.5 * scale))
 	end
-	return makeBoxHull(part, cf, size * 0.95)
+	return makeBoxHull(part, cf, size * (0.95 * scale))
 end
 
 -- Limb chains (upper arm + lower arm + hand ...) are merged into one outline so the
@@ -2983,10 +3304,10 @@ local approxGroupOrder = {}
 -- Per-part approximation: heads are ellipsoids, everything else is its real
 -- oriented box. Used for the slivers an exact silhouette cannot cover and for
 -- close characters that did not get a silhouette.
-local function drawApproximateCharacter(state, plane, lightDir, pieces)
+local function drawApproximateCharacter(state, plane, lightDir, pieces, scale, bodyOnly)
 	for _, info in ipairs(state.parts) do
-		if info.lit > 0.5 and isPartVisibleForShadow(info.part) then
-			local proj = computeHullProjection(partApproxHull(info), lightDir, plane)
+		if info.lit > 0.5 and isPartVisibleForShadow(info.part) and not (bodyOnly and info.isAcc) then
+			local proj = computeHullProjection(partApproxHull(info, scale), lightDir, plane)
 			if proj and proj.poly then
 				local key = groupKeyFor(info)
 				local list = approxGroupPts[key]
@@ -3078,7 +3399,7 @@ local function discoverCharacterReceivers(state, lightDir, maxRays)
 			break
 		end
 		local part = info.part
-		if info.lit > 0.5 and isPartVisibleForShadow(part) then
+		if isPartVisibleForShadow(part) then
 			rays = rays + 1
 			local origin = part.Position
 			local hit = Workspace:Raycast(origin, rayVec, rayParams)
@@ -3223,22 +3544,106 @@ end
 
 local silhouetteAnnounced = false
 
--- Surfaces the shadow lands on + what the light still reaches there. Cached for
--- a few frames: the set of surfaces under a walking character barely changes.
+-- Removes `statics` (shadow polygons already painted on the surface) from `pieces`.
+local function subtractStaticPolys(pieces, statics)
+	local used = 0
+	for _, poly in ipairs(statics) do
+		if #pieces == 0 or #pieces > 20 or used >= 14 then
+			break
+		end
+		local pa, pb, pc, pd = polygonBounds2D(poly)
+		local sub = ensureCCW(poly)
+		local newPieces = {}
+		for _, pcPiece in ipairs(pieces) do
+			local a, b, c, d = polygonBounds2D(pcPiece)
+			if b >= pa and a <= pb and d >= pc and c <= pd then
+				for _, diff in ipairs(subtractConvex2D(pcPiece, sub, 0.01)) do
+					newPieces[#newPieces + 1] = diff
+				end
+			else
+				newPieces[#newPieces + 1] = pcPiece
+			end
+		end
+		pieces = newPieces
+		used = used + 1
+	end
+	return pieces
+end
+
+-- Surfaces the shadow lands on + what is still unshaded there. Cached for a few frames:
+-- the set of surfaces under a walking character barely changes.
+--
+-- STENCIL SEMANTICS: the character's shadow volume is intersected with the part of the
+-- surface that is not already in shadow. "Already in shadow" is read from the baked
+-- static layer (the polygons the player can actually see), so a character walking into a
+-- building's shadow merges with it: nothing is darkened twice and no gap appears.
 local function refreshCharacterReceivers(state, lightDir, maxRays)
 	local planes, occluders = discoverCharacterReceivers(state, lightDir, maxRays)
+	local rootPos = state.root.Position
 	local list = {}
+	local haveFloor, floorShaded = false, false
+	local nStatics = 0
 	for i = 1, math.min(#planes, 4) do
 		local plane = planes[i]
-		local pieces = computeVisiblePieces(plane, occluders, lightDir)
-		if #pieces > 0 then
-			list[#list + 1] = { plane = plane, pieces = pieces }
+		local nDotL = plane.normal:Dot(lightDir)
+		if nDotL < -0.03 then
+			-- Footprint of the whole character on this surface (plane space, padded).
+			local minU, maxU, minV, maxV = math.huge, -math.huge, math.huge, -math.huge
+			for _, info in ipairs(state.parts) do
+				local part = info.part
+				if isPartVisibleForShadow(part) then
+					local p = part.Position
+					local t = (plane.origin - p):Dot(plane.normal) / nDotL
+					local uv = worldToPlane2D(plane, p + lightDir * math.max(t, 0))
+					local r = info.radius
+					if not r then
+						r = getVisualRadius(part)
+						info.radius = r
+					end
+					if uv.X - r < minU then minU = uv.X - r end
+					if uv.X + r > maxU then maxU = uv.X + r end
+					if uv.Y - r < minV then minV = uv.Y - r end
+					if uv.Y + r > maxV then maxV = uv.Y + r end
+				end
+			end
+			if minU < maxU then
+				local pad = 3
+				local region = { minU = minU - pad, maxU = maxU + pad, minV = minV - pad, maxV = maxV + pad }
+				local statics = {}
+				collectStaticShadowPolys(plane, region.minU, region.maxU, region.minV, region.maxV, statics, {})
+				nStatics = nStatics + #statics
+				if i == 1 then
+					haveFloor = true
+					local rootUV = worldToPlane2D(plane, rootPos)
+					for _, poly in ipairs(statics) do
+						if isPointInConvex2D(ensureCCW(poly), rootUV, 0.05) then
+							floorShaded = true
+							break
+						end
+					end
+				end
+				local pieces = computeVisiblePieces(plane, occluders, lightDir, region)
+				if #pieces > 0 then
+					pieces = subtractStaticPolys(pieces, statics)
+				end
+				if #pieces > 0 then
+					list[#list + 1] = { plane = plane, pieces = pieces }
+				end
+			end
 		end
 	end
+	state.floorTarget = (haveFloor and floorShaded) and 0 or 1
 	state.recv = list
 	state.recvFrame = frameCounter
-	state.recvPos = state.root.Position
+	state.recvPos = rootPos
 	state.recvLight = lightDir
+	local dg = state.diag
+	dg.planes = #planes
+	dg.usable = #list
+	dg.statics = nStatics
+	dg.haveFloor = haveFloor
+	dg.floorShaded = floorShaded
+	dg.floorPart = (planes[1] and planes[1].part and planes[1].part.Name) or "-"
 end
 
 local usedProjectorScratch = {}
@@ -3248,7 +3653,7 @@ local function renderCharacterShadow(state, lightDir, distance, allowSilhouette,
 	local recv = state.recv
 	if not recv
 		or frameCounter - state.recvFrame >= interval
-		or (state.root.Position - state.recvPos).Magnitude > 2.5
+		or (state.root.Position - state.recvPos).Magnitude > 1.5
 		or (state.recvLight - lightDir).Magnitude > 0.003 then
 		refreshCharacterReceivers(state, lightDir, (distance < CONFIG.SilhouetteDistance) and 24 or 6)
 		recv = state.recv
@@ -3260,6 +3665,10 @@ local function renderCharacterShadow(state, lightDir, distance, allowSilhouette,
 	end
 	local nearApprox = distance <= CONFIG.FarHullDistance * qualityLevel
 	clearTable(usedProjectorScratch)
+	local dg = state.diag
+	dg.silAllowed = allowSilhouette
+	dg.silPlaced = 0
+	dg.core = false
 
 	for idx, rp in ipairs(recv) do
 		local plane = rp.plane
@@ -3284,6 +3693,14 @@ local function renderCharacterShadow(state, lightDir, distance, allowSilhouette,
 				reportError("silhouette", used)
 			elseif used then
 				usedProjectorScratch[idx] = true
+				dg.silPlaced = dg.silPlaced + 1
+			end
+			-- Safety net for YOUR character: a slightly shrunken outline of the real parts is
+			-- always drawn under the exact silhouette. If the silhouette renders it is hidden
+			-- inside it; if the device cannot render the ViewportFrame it is still a shadow.
+			if isLocal and CONFIG.LocalPlayerCore and qualityLevel >= 0.5 then
+				drawApproximateCharacter(state, plane, lightDir, rp.pieces, 0.82, true)
+				dg.core = true
 			end
 		elseif nearApprox then
 			drawApproximateCharacter(state, plane, lightDir, rp.pieces)
@@ -3307,7 +3724,7 @@ local bakeCursor = 1
 local lightEpoch = 0
 local bakedLightDir = nil
 local DOWN_PROBE_VEC = Vector3.new(0, -160, 0)
-local scan = { active = false, cursor = 1, list = {}, focus = Vector3.new(0, -1e6, 0), lastEnd = -1e9 }
+local scan = { active = false, cursor = 1, focus = Vector3.new(0, -1e6, 0), lastEnd = -1e9, version = -1 }
 
 local function getCasterProbePoints(hull, near)
 	local pts = { hull.center }
@@ -3460,6 +3877,10 @@ local function bakeCaster(part, st, lightDir, now)
 	removeCasterContribs(st)
 	st.cf = part.CFrame
 	st.size = part.Size
+	local cidx = casterIndex[part]
+	if cidx then
+		casterPos[cidx] = part.Position
+	end
 	st.epoch = lightEpoch
 	st.bakedAt = now
 	st.dynamic = not part.Anchored
@@ -3468,18 +3889,82 @@ local function bakeCaster(part, st, lightDir, now)
 	end
 end
 
+local stepCasterScan, stepMapBaking
+do
+-- ----------------------------------------------------------------------------
+-- Nearest-K selection with a bounded max-heap: no sorting of thousands of parts and
+-- no per-candidate table allocation (both showed up as hitches on a phone).
+-- ----------------------------------------------------------------------------
+local heapKey, heapD, heapP, heapN, heapK = {}, {}, {}, 0, 0
+
+-- Max-heap on `key` (smaller key = more important). Each entry also carries its true
+-- distance `sd` (used to order baking) and the part.
+local function heapPush(key, sd, part)
+	if heapN < heapK then
+		heapN = heapN + 1
+		local i = heapN
+		while i > 1 do
+			local p = math.floor(i / 2)
+			if heapKey[p] >= key then
+				break
+			end
+			heapKey[i], heapD[i], heapP[i] = heapKey[p], heapD[p], heapP[p]
+			i = p
+		end
+		heapKey[i], heapD[i], heapP[i] = key, sd, part
+	elseif key < heapKey[1] then
+		local i = 1
+		while true do
+			local l = i * 2
+			if l > heapN then
+				break
+			end
+			local c = l
+			if l + 1 <= heapN and heapKey[l + 1] > heapKey[l] then
+				c = l + 1
+			end
+			if heapKey[c] <= key then
+				break
+			end
+			heapKey[i], heapD[i], heapP[i] = heapKey[c], heapD[c], heapP[c]
+			i = c
+		end
+		heapKey[i], heapD[i], heapP[i] = key, sd, part
+	end
+end
+
+local RING_EDGES = { 40, 80, 160, 320, 640, 1280, 2560 }
+
 local function finishCasterScan()
-	local list = scan.list
-	table.sort(list, function(a, b)
-		return a.d < b.d
-	end)
-	local limit = math.max(80, math.floor(CONFIG.MaxMapCasters * (0.4 + 0.6 * qualityLevel)))
+	-- Bucket the K nearest by distance ring so baking goes roughly nearest-first.
+	local rings = {}
+	for i = 1, #RING_EDGES + 1 do
+		rings[i] = {}
+	end
+	for i = 1, heapN do
+		local d = heapD[i]
+		local ring = #RING_EDGES + 1
+		for r = 1, #RING_EDGES do
+			if d <= RING_EDGES[r] then
+				ring = r
+				break
+			end
+		end
+		local bucket = rings[ring]
+		bucket[#bucket + 1] = heapP[i]
+		heapP[i] = nil
+	end
+	heapN = 0
 	clearTable(nearbyList)
 	clearTable(nearbySet)
-	for i = 1, math.min(#list, limit) do
-		local part = list[i].part
-		nearbyList[i] = part
-		nearbySet[part] = true
+	local n = 0
+	for r = 1, #rings do
+		local bucket = rings[r]
+		for j = 1, #bucket do
+			n = n + 1
+			nearbyList[n] = bucket[j]
+			nearbySet[bucket[j]] = true
+		end
 	end
 	for part, st in pairs(casterStates) do
 		if not nearbySet[part] then
@@ -3490,19 +3975,20 @@ local function finishCasterScan()
 	bakeCursor = 1
 	scan.active = false
 	scan.lastEnd = wallNow()
-	scan.list = {}
 end
 
 -- Looks for casters around the camera a slice at a time (no frame hitch on big maps).
-local function stepCasterScan(now)
+function stepCasterScan(now)
 	if not scan.active then
 		local moved = (camPos - scan.focus).Magnitude
 		if now - scan.lastEnd >= CONFIG.MapRefreshInterval
-			and (moved > 12 or #nearbyList == 0 or now - scan.lastEnd > 4) then
+			and (moved > 12 or #nearbyList == 0 or casterVersion - scan.version > 150 or now - scan.lastEnd > 20) then
 			scan.active = true
 			scan.cursor = 1
 			scan.focus = camPos
-			scan.list = {}
+			scan.version = casterVersion
+			heapN = 0
+			heapK = math.max(80, math.floor(CONFIG.MaxMapCasters * (0.4 + 0.6 * qualityLevel)))
 		else
 			return
 		end
@@ -3510,17 +3996,24 @@ local function stepCasterScan(now)
 	local n = #casterList
 	local last = math.min(n, scan.cursor + CONFIG.ScanSlice - 1)
 	local focus = scan.focus
-	local maxD = CONFIG.MaxRenderDistance
+	local maxD = effectiveRenderDistance()
 	local ang = CONFIG.MinCasterAngularSize
-	local out = scan.list
 	for i = scan.cursor, last do
 		local part = casterList[i]
-		if part and part.Parent then
-			local mag = part.Size.Magnitude
-			local d = (part.Position - focus).Magnitude
+		if part then
+			local pos = casterDyn[i] and part.Position or casterPos[i]
+			local mag = casterMag[i]
+			local d = (pos - focus).Magnitude
 			local sd = d - mag * 0.5
 			if sd <= maxD and (d < 90 or mag >= d * ang) then
-				out[#out + 1] = { part = part, d = sd }
+				-- Importance = apparent size: a huge wall far away outranks a tiny prop up close.
+				local key = (sd + 30) / (mag + 4)
+				if heapN < heapK or key < heapKey[1] then
+					-- Only now touch live properties: hidden parts never cast shadows.
+					if part.Parent and isPartOpaqueEnough(part) then
+						heapPush(key, sd, part)
+					end
+				end
 			end
 		end
 	end
@@ -3531,7 +4024,11 @@ local function stepCasterScan(now)
 end
 
 -- Nearest-first, time-budgeted baking. Static shadows are then left alone.
-local function stepMapBaking(lightDir, deadline, now)
+local lastOpaque = setmetatable({}, { __mode = "k" })
+local lastFlipTime = -1e9
+local BIG_PART_MAG = 25
+
+function stepMapBaking(lightDir, deadline, now)
 	local n = #nearbyList
 	if n == 0 then
 		return
@@ -3551,18 +4048,41 @@ local function stepMapBaking(lightDir, deadline, now)
 		bakeCursor = bakeCursor + 1
 		if part and part.Parent then
 			local st = casterStates[part]
-			local need = false
-			if not st or st.epoch ~= lightEpoch then
-				need = true
-			elseif part.CFrame ~= st.cf or part.Size ~= st.size then
-				need = (not st.dynamic) or (now - st.bakedAt >= 0.15)
+			local opaque = isPartOpaqueEnough(part)
+			local was = lastOpaque[part]
+			if was ~= opaque then
+				lastOpaque[part] = opaque
+				if was ~= nil then
+					-- A big part (roof, wall) appearing/disappearing changes what shades
+					-- everything around it: re-bake the neighbourhood (rate limited).
+					local idx = casterIndex[part]
+					if idx and casterMag[idx] >= BIG_PART_MAG and now - lastFlipTime > 0.5 then
+						lastFlipTime = now
+						lightEpoch = lightEpoch + 1
+					end
+				end
 			end
-			if need and (baked < minBakes or os.clock() < deadline) then
-				bakeCaster(part, st, lightDir, now)
-				baked = baked + 1
+			if not opaque then
+				if st then
+					removeCasterContribs(st)
+					casterStates[part] = nil
+				end
+			else
+				local need = false
+				if not st or st.epoch ~= lightEpoch then
+					need = true
+				elseif part.CFrame ~= st.cf or part.Size ~= st.size then
+					need = (not st.dynamic) or (now - st.bakedAt >= 0.15)
+				end
+				if need and (baked < minBakes or os.clock() < deadline) then
+					bakeCaster(part, st, lightDir, now)
+					baked = baked + 1
+				end
 			end
 		end
 	end
+end
+
 end
 
 -- ============================================================================
@@ -3570,6 +4090,7 @@ end
 -- ============================================================================
 local function computeLightDirection()
 	local sunRaw = Lighting:GetSunDirection()
+	local rawY = sunRaw.Y
 	local dir, strength
 	local function fade(y)
 		if not CONFIG.FadeWithSunElevation then
@@ -3582,6 +4103,7 @@ local function computeLightDirection()
 		strength = fade(sunRaw.Y)
 	else
 		dir = Lighting:GetMoonDirection()
+		rawY = dir.Y
 		strength = CONFIG.NightShadowStrength * fade(dir.Y)
 	end
 
@@ -3593,7 +4115,7 @@ local function computeLightDirection()
 		end
 		dir = horiz.Unit * math.sqrt(1 - minEl * minEl) + VEC3_Y * minEl
 	end
-	return -dir.Unit, dir.Unit, strength
+	return -dir.Unit, dir.Unit, strength, rawY
 end
 
 local function getCharacterRoot(model)
@@ -3616,10 +4138,20 @@ local function releaseCharacterState(model)
 	end
 end
 
--- Adaptive quality: sheds work when the frame rate drops, recovers slowly.
-local perf = { avgDt = 1 / 60, timer = 0, frameMs = 0 }
+-- Adaptive quality: sheds work when the frame rate drops, recovers slowly. The limit is
+-- relative to the fastest sustained frame time this device reached (so a phone that did
+-- 80 fps and now does 55 is "lagging" even though 55 is fine in absolute terms), and never
+-- laxer than TargetFps.
+local perf = { avgDt = 1 / 60, bestDt = 1 / 30, limit = 1 / 45, timer = 0, frameMs = 0 }
 local function updateGovernor(dt)
 	perf.avgDt = perf.avgDt + (math.min(dt, 0.2) - perf.avgDt) * 0.05
+	if frameCounter > 150 then
+		if perf.avgDt < perf.bestDt then
+			perf.bestDt = perf.avgDt
+		else
+			perf.bestDt = perf.bestDt + (perf.avgDt - perf.bestDt) * 0.0015
+		end
+	end
 	perf.timer = perf.timer + dt
 	if perf.timer < 0.5 then
 		return
@@ -3630,10 +4162,11 @@ local function updateGovernor(dt)
 		lodStep = 1
 		return
 	end
-	local target = 1 / CONFIG.TargetFps
-	if perf.avgDt > target * 1.12 then
+	local limit = math.min(math.clamp(perf.bestDt * 1.25, 1 / 90, 1 / 30), 1 / CONFIG.TargetFps)
+	perf.limit = limit
+	if perf.avgDt > limit * 1.05 then
 		qualityLevel = math.max(CONFIG.MinQuality, qualityLevel - 0.08)
-	elseif perf.avgDt < target * 0.92 then
+	elseif perf.avgDt < limit * 0.9 then
 		qualityLevel = math.min(1, qualityLevel + 0.04)
 	end
 	if qualityLevel < 0.5 then
@@ -3657,6 +4190,8 @@ local function collectStats()
 		quality = qualityLevel,
 		fps = 1 / math.max(perf.avgDt, 1e-4),
 		scriptMsPerFrame = perf.frameMs,
+		limitMs = perf.limit * 1000,
+		lodScale = math.min(lodStep, lodBudgetStep),
 		boundTiles = bound,
 		totalTiles = total,
 		shadowPrimitives = prims,
@@ -3666,6 +4201,109 @@ local function collectStats()
 		tileBuildQueue = queue,
 		silhouetteProjectors = projectors,
 	}
+end
+
+-- ============================================================================
+-- ON-SCREEN DEBUG OVERLAY (Debug = true): readable on a phone, shows where time goes
+-- ============================================================================
+local phases = { chars = 0, scan = 0, bake = 0, tiles = 0, fx = 0 }   -- peak ms since the last refresh
+local overlay = { gui = nil, label = nil, nextUpdate = 0, sunRaw = 0, sunUsed = 0, strength = 0 }
+
+local ensureOverlay
+do
+function ensureOverlay()
+	if overlay.label then
+		return true
+	end
+	local parent = nil
+	pcall(function()
+		if gethui then
+			parent = gethui()
+		end
+	end)
+	if not parent then
+		pcall(function()
+			parent = game:GetService("CoreGui")
+		end)
+	end
+	if not parent then
+		pcall(function()
+			local lp = Players.LocalPlayer
+			parent = lp and lp:FindFirstChildOfClass("PlayerGui")
+		end)
+	end
+	if not parent then
+		return false
+	end
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "StencilShadowDebug"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 2147483647
+	local label = Instance.new("TextLabel")
+	label.BackgroundColor3 = Color3.new(0, 0, 0)
+	label.BackgroundTransparency = 0.3
+	label.BorderSizePixel = 0
+	label.AnchorPoint = Vector2.new(1, 0)
+	label.Position = UDim2.new(1, -4, 0, 96)
+	label.Size = UDim2.new(0, 330, 0, 150)
+	label.Font = Enum.Font.Code
+	label.TextSize = 11
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextYAlignment = Enum.TextYAlignment.Top
+	label.Text = ""
+	label.Parent = gui
+	local ok = pcall(function()
+		gui.Parent = parent
+	end)
+	if not ok then
+		pcall(function()
+			gui:Destroy()
+		end)
+		return false
+	end
+	overlay.gui, overlay.label = gui, label
+	return true
+end
+end
+
+local function updateOverlay(now, localChar)
+	if now < overlay.nextUpdate then
+		return
+	end
+	overlay.nextUpdate = now + 0.5
+	if not ensureOverlay() then
+		return
+	end
+	local s = collectStats()
+	local el = function(y)
+		return math.deg(math.asin(math.clamp(y, -1, 1)))
+	end
+	local lines = {}
+	lines[1] = string.format("StencilShadow %s q%.2f %dfps lim%.0fms%s", VERSION, s.quality, math.floor(s.fps + 0.5), s.limitMs, usingMobilePreset and " mobile" or "")
+	lines[2] = string.format("script %.1fms res x%.2f", s.scriptMsPerFrame, s.lodScale)
+	lines[3] = string.format("peak ch%.1f sc%.1f bk%.1f ti%.1f fx%.1f ms", phases.chars, phases.scan, phases.bake, phases.tiles, phases.fx)
+	for k in pairs(phases) do
+		phases[k] = 0
+	end
+	lines[4] = string.format("tiles %d/%d q%d prims %d", s.boundTiles, s.totalTiles, s.tileBuildQueue, s.shadowPrimitives)
+	lines[5] = string.format("casters %d/%d baked %d", s.casterNearby, s.casterCandidates, s.castersBaked)
+	lines[6] = string.format("sun %.0fdeg (used %.0f) s%.2f", el(overlay.sunRaw), el(overlay.sunUsed), overlay.strength)
+	local st = localChar and charStates[localChar]
+	if st then
+		local dg = st.diag
+		local first = st.parts[1]
+		lines[7] = string.format("YOU lit%.2f parts%d planes%s/%s st%s", first and first.lit or -1, #st.parts,
+			tostring(dg.usable), tostring(dg.planes), tostring(dg.statics))
+		lines[8] = string.format("%s on %s sil%s/%s core%s", dg.haveFloor and (dg.floorShaded and "SHADED" or "lit") or "nofloor",
+			tostring(dg.floorPart), tostring(dg.silPlaced), tostring(dg.silAllowed and 1 or 0), dg.core and "on" or "off")
+	else
+		lines[7] = "YOU: no character yet"
+	end
+	lines[#lines + 1] = "err " .. string.sub(lastErrorText, 1, 46)
+	overlay.label.Size = UDim2.new(0, 330, 0, #lines * 13 + 6)
+	overlay.label.Text = table.concat(lines, "\n")
 end
 
 local lastDebugPrint = wallNow()
@@ -3700,7 +4338,10 @@ local conn = RunService.RenderStepped:Connect(function(dt)
 		rayParams.FilterDescendantsInstances = globalRaycastIgnoreList
 	end
 
-	local lightDir, sunDir, strength = computeLightDirection()
+	local dbg = CONFIG.Debug
+	local tPhase = dbg and os.clock() or 0
+	local lightDir, sunDir, strength, rawSunY = computeLightDirection()
+	overlay.sunRaw, overlay.sunUsed, overlay.strength = rawSunY, sunDir.Y, strength
 	currentShadowStrength = strength
 	currentGroupTransparency = 1 - math.clamp(CONFIG.ShadowDarkness * strength, 0, 1)
 	local shadowsOn = strength > 0.01
@@ -3742,10 +4383,7 @@ local conn = RunService.RenderStepped:Connect(function(dt)
 		-- Characters whose shadow cannot be on screen cost nothing.
 		if c.isLocal or isSphereOnScreen(c.root.Position, shadowReach) then
 			local detailed = c.isLocal or (rank <= 3 and c.dist < 120)
-			local okL, errL = pcall(updateCharacterLighting, state, sunDir, dt, detailed)
-			if not okL then
-				reportError("lighting", errL)
-			end
+			updateCharacterLighting(state, dt)
 			if c.dist < 300 then
 				queueSelfShadow(state, c.dist)
 			end
@@ -3790,19 +4428,44 @@ local conn = RunService.RenderStepped:Connect(function(dt)
 		end
 	end
 
+	if dbg then
+		local t = os.clock()
+		phases.chars = math.max(phases.chars, (t - tPhase) * 1000)
+		tPhase = t
+	end
+
 	-- 2. MAP CASTERS (retained: bake once, then nothing per frame)
 	if shadowsOn and CONFIG.IncludeMapParts then
 		stepCasterScan(now)
+		if dbg then
+			local t = os.clock()
+			phases.scan = math.max(phases.scan, (t - tPhase) * 1000)
+			tPhase = t
+		end
 		local scale = 0.4 + 0.6 * qualityLevel
 		stepMapBaking(lightDir, os.clock() + CONFIG.BakeBudgetSeconds * scale, now)
+		if dbg then
+			local t = os.clock()
+			phases.bake = math.max(phases.bake, (t - tPhase) * 1000)
+			tPhase = t
+		end
 	end
 
 	-- 3. TILES (visibility / LOD pass, then budgeted canvas (re)builds)
 	refreshTileStates(now)
 	processTileQueue(os.clock() + CONFIG.TileBuildBudgetSeconds * (0.4 + 0.6 * qualityLevel))
+	if dbg then
+		local t = os.clock()
+		phases.tiles = math.max(phases.tiles, (t - tPhase) * 1000)
+		tPhase = t
+	end
 
 	applySelfShadowHighlights()
 	finalizeCanvasSlotsForFrame()
+	if dbg then
+		phases.fx = math.max(phases.fx, (os.clock() - tPhase) * 1000)
+		updateOverlay(now, localChar)
+	end
 
 	perf.frameMs = perf.frameMs + ((os.clock() - frameStart) * 1000 - perf.frameMs) * 0.1
 	if CONFIG.Debug and now - lastDebugPrint > 5 then
@@ -3834,5 +4497,6 @@ globalEnv._StencilShadowCleanup = function()
 	globalEnv.StencilShadowStats = nil
 end
 
-print("[StencilShadow " .. VERSION .. "] running | exact silhouettes via ViewportFrame | retained map shadows | range "
-	.. tostring(CONFIG.MaxRenderDistance) .. " studs | AutoQuality " .. tostring(CONFIG.AutoQuality))
+print("[StencilShadow " .. VERSION .. "] running | " .. (usingMobilePreset and "MOBILE preset" or "desktop preset")
+	.. " | range " .. tostring(math.floor(CONFIG.MaxRenderDistance)) .. " studs | AutoQuality " .. tostring(CONFIG.AutoQuality)
+	.. (CONFIG.Debug and " | on-screen diagnostics ON (Debug = false hides them)" or ""))
