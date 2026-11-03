@@ -2456,7 +2456,9 @@ local function updateCharacterLighting(state, sunDir, dt, detailed)
 		interval = interval * 2
 	end
 	if state.lightTick >= interval or not state.lightInit then
-		state.lightTick = 0
+		-- Start the next countdown at 1 so these rays fall on a different frame
+		-- than the receiver search (which runs on the same interval).
+		state.lightTick = 1
 		state.lightInit = true
 		runRays = true
 	end
@@ -3248,7 +3250,7 @@ local function renderCharacterShadow(state, lightDir, distance, allowSilhouette,
 		or frameCounter - state.recvFrame >= interval
 		or (state.root.Position - state.recvPos).Magnitude > 2.5
 		or (state.recvLight - lightDir).Magnitude > 0.003 then
-		refreshCharacterReceivers(state, lightDir, (distance < CONFIG.SilhouetteDistance) and 40 or 8)
+		refreshCharacterReceivers(state, lightDir, (distance < CONFIG.SilhouetteDistance) and 24 or 6)
 		recv = state.recv
 	end
 
